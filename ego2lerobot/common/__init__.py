@@ -15,6 +15,7 @@ from .ray_executor import (
     RayExecutorConfig,
     RayPreflightError,
     build_runtime_env,
+    resolve_address,
 )
 from .state import (
     commit_output,
@@ -45,6 +46,7 @@ __all__ = [
     "partial_path",
     "prepare_output",
     "read_manifest",
+    "resolve_address",
     "safe_name",
     "summarize_discovery",
     "summarize_results",

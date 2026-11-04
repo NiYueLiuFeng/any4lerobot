@@ -46,7 +46,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from ego2lerobot.common.ray_executor import RayExecutorConfig, build_runtime_env
+from ego2lerobot.common.ray_executor import (
+    RayExecutorConfig,
+    build_runtime_env,
+    resolve_address,
+)
 from ego2lerobot.common.state import SUCCESS_MARKER, partial_path
 from ego2lerobot.common.types import TaskResult
 from ego2lerobot.config import PipelineConfig
@@ -424,7 +428,7 @@ def _run_stage(
             RayExecutorConfig(address=ray_address, working_dir=working_dir)
         )
         ray.init(
-            address=_resolve_address(ray_address),
+            address=resolve_address(ray_address),
             ignore_reinit_error=True,
             include_dashboard=False,
             runtime_env=runtime_env,
@@ -440,14 +444,6 @@ def _run_stage(
         flush=True,
     )
     return len(items)
-
-
-def _resolve_address(address: str | None) -> str | None:
-    if address is None:
-        return None
-    if address.strip().lower() in {"", "local", "none"}:
-        return None
-    return address
 
 
 __all__ = ["AggregateNotSupported", "aggregate_with_ray_data"]

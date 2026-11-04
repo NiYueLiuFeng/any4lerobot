@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator, Sequence
@@ -130,9 +131,13 @@ def _matches_dir(relative: PurePosixPath, patterns: Iterable[str]) -> bool:
 
 
 def _accept(config: DiscoveryConfig, path: Path) -> bool:
-    if config.file_filter is None:
-        return True
-    return bool(config.file_filter(path))
+    return config.file_filter is None or bool(config.file_filter(path))
+
+
+def _join(relative_dir: PurePosixPath, name: str) -> PurePosixPath:
+    """Append a name to a relative directory, where ``"."`` means the root."""
+
+    return PurePosixPath(name) if str(relative_dir) == "." else relative_dir / name
 
 
 def _stat_key(path: Path) -> tuple[int, int] | None:
@@ -163,9 +168,8 @@ def _walk(
             key = _stat_key(root) if config.dedupe else None
             if key is not None and key in seen_inodes:
                 return
-            if config.dedupe:
-                if key is not None:
-                    seen_inodes.add(key)
+            if key is not None:
+                seen_inodes.add(key)
             if root in seen_paths:
                 return
             seen_paths.add(root)
@@ -182,7 +186,7 @@ def _walk(
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=config.follow_symlinks):
         current = Path(dirpath)
-        depth = len(current.relative_to(root).parts)
+        depth = len(current.relative_to(root).parts) if config.max_depth is not None else 0
         try:
             relative_dir = PurePosixPath(current.relative_to(root).as_posix())
         except ValueError:
@@ -193,8 +197,7 @@ def _walk(
         for name in sorted(dirnames):
             if name in config.skip_dirs:
                 continue
-            child = relative_dir / name if str(relative_dir) != "." else PurePosixPath(name)
-            if _matches_dir(child, config.exclude):
+            if _matches_dir(_join(relative_dir, name), config.exclude):
                 continue
             if config.max_depth is not None and depth + 1 > config.max_depth:
                 continue
@@ -207,9 +210,7 @@ def _walk(
             path = current / filename
             if path.is_symlink() and not config.follow_symlinks:
                 continue
-            relative = (
-                relative_dir / filename if str(relative_dir) != "." else PurePosixPath(filename)
-            )
+            relative = _join(relative_dir, filename)
             if not _matches_any(relative, config.include):
                 continue
             if _matches_any(relative, config.exclude):
@@ -217,14 +218,17 @@ def _walk(
             if not _accept(config, path):
                 continue
 
-            key = _stat_key(path) if config.dedupe else None
-            if key is None:
-                # Broken link or unreadable entry: report nothing, do not fail
+            try:
+                # One stat call supplies both the dedupe key and the metadata.
+                stat = path.stat()
+            except OSError:
+                # Broken link or unreadable entry: skip it instead of failing
                 # the whole scan.
                 continue
-            if config.dedupe and key in seen_inodes:
+            key = (stat.st_dev, stat.st_ino) if config.dedupe else None
+            if key is not None and key in seen_inodes:
                 continue
-            if config.dedupe:
+            if key is not None:
                 seen_inodes.add(key)
 
             resolved = path.resolve()
@@ -232,10 +236,6 @@ def _walk(
                 continue
             seen_paths.add(resolved)
 
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
             yield DiscoveredFile(
                 path=resolved,
                 root=root,
@@ -276,16 +276,11 @@ def discover_files(config: DiscoveryConfig) -> list[DiscoveredFile]:
 def summarize_discovery(files: Sequence[DiscoveredFile]) -> dict[str, Any]:
     """Small counters for logs."""
 
-    by_suffix: dict[str, int] = {}
-    total_size = 0
-    roots: set[str] = set()
-    for item in files:
-        by_suffix[item.suffix] = by_suffix.get(item.suffix, 0) + 1
-        total_size += item.size
-        roots.add(str(item.root))
+    by_suffix = Counter(item.suffix for item in files)
+    total_size = sum(item.size for item in files)
     return {
         "files": len(files),
-        "roots": sorted(roots),
+        "roots": sorted({str(item.root) for item in files}),
         "by_suffix": dict(sorted(by_suffix.items())),
         "total_bytes": total_size,
         "total_gib": round(total_size / (1024**3), 3),

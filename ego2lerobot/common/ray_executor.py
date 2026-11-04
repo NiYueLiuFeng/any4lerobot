@@ -32,6 +32,7 @@ import sys
 import time
 import uuid
 import warnings
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,7 +189,7 @@ class RayExecutor:
         if ray.is_initialized():
             return ray
 
-        address = _resolve_address(self.config.address)
+        address = resolve_address(self.config.address)
         runtime_env = build_runtime_env(self.config)
         ray.init(
             address=address,
@@ -378,17 +379,11 @@ class RayExecutor:
             raise
 
         # Defensive: guarantee one result per task and preserve input order.
-        ordered: list[TaskResult] = []
-        for task in tasks:
-            result = results_by_id.get(task.task_id)
-            if result is None:
-                result = TaskResult(
-                    task_id=task.task_id,
-                    status="failed",
-                    output_path=str(task.output_path),
-                    error="task was submitted but no result was returned",
-                )
-            ordered.append(result)
+        ordered = [
+            results_by_id.get(task.task_id)
+            or _failed_result(task, "task was submitted but no result was returned")
+            for task in tasks
+        ]
         if self.config.progress and tasks:
             print(flush=True)
         return ordered
@@ -397,16 +392,7 @@ class RayExecutor:
         try:
             value = ray.get(ref)
         except Exception as exc:
-            message = _short_error(exc)
-            return [
-                TaskResult(
-                    task_id=task.task_id,
-                    status="failed",
-                    output_path=str(task.output_path),
-                    error=f"Ray task failed: {message}",
-                )
-                for task in batch
-            ]
+            return [_failed_result(task, f"Ray task failed: {_short_error(exc)}") for task in batch]
 
         if isinstance(value, TaskResult):
             value = [value]
@@ -415,41 +401,25 @@ class RayExecutor:
                 f"worker returned {type(value).__name__}, expected TaskResult "
                 "or a list of TaskResult"
             )
-            return [
-                TaskResult(
-                    task_id=task.task_id,
-                    status="failed",
-                    output_path=str(task.output_path),
-                    error=message,
-                )
-                for task in batch
-            ]
+            return [_failed_result(task, message) for task in batch]
 
         returned = {result.task_id: result for result in value if isinstance(result, TaskResult)}
-        collected: list[TaskResult] = []
-        for task in batch:
-            result = returned.get(task.task_id)
-            if result is None:
-                result = TaskResult(
-                    task_id=task.task_id,
-                    status="failed",
-                    output_path=str(task.output_path),
-                    error="worker returned no result for this task",
-                )
-            collected.append(result)
-        return collected
+        return [
+            returned.get(task.task_id)
+            or _failed_result(task, "worker returned no result for this task")
+            for task in batch
+        ]
 
     def _print_progress(
         self, results_by_id: dict[str, TaskResult], total: int, pending: int
     ) -> None:
         if not self.config.progress:
             return
-        ok = sum(1 for result in results_by_id.values() if result.status == "ok")
-        skipped = sum(1 for result in results_by_id.values() if result.status == "skipped")
-        failed = sum(1 for result in results_by_id.values() if result.status == "failed")
+        counts = Counter(result.status for result in results_by_id.values())
         print(
             f"\r[ray] {len(results_by_id)}/{total} "
-            f"ok={ok} skipped={skipped} failed={failed} in_flight={pending}",
+            f"ok={counts['ok']} skipped={counts['skipped']} "
+            f"failed={counts['failed']} in_flight={pending}",
             end="",
             flush=True,
         )
@@ -476,7 +446,20 @@ class RayExecutor:
 # --------------------------------------------------------------------- helpers
 
 
-def _resolve_address(address: str | None) -> str | None:
+def _failed_result(task: ConversionTask, error: str) -> TaskResult:
+    """Pair one task with a failure reason, preserving its output path."""
+
+    return TaskResult(
+        task_id=task.task_id,
+        status="failed",
+        output_path=str(task.output_path),
+        error=error,
+    )
+
+
+def resolve_address(address: str | None) -> str | None:
+    """Normalise a configured Ray address; ``None`` means a local instance."""
+
     if address is None:
         return None
     if address.strip().lower() in {"", "local", "none"}:
@@ -632,4 +615,5 @@ __all__ = [
     "RayPreflightError",
     "WorkerFn",
     "build_runtime_env",
+    "resolve_address",
 ]
