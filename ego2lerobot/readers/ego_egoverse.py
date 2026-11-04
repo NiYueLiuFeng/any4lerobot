@@ -10,7 +10,7 @@ An EgoVerse *sub-dataset* is one Zarr v3 group directory::
       images.front_1/            # (T,) variable-length JPEG bytes
       annotations/               # (N,) JSON strings (may be empty)
 
-One sub-dataset is one episode, so discovery should match its unique anchor::
+One sub-dataset is one episode, so discovery matches its unique anchor::
 
     python -m ego2lerobot convert -c ego2lerobot/configs/ego_egoverse.yaml \\
         --root /data/egoverse --include '**/zarr.json'
@@ -24,30 +24,29 @@ Config::
         obs.timestamps_ns: obs_rgb_timestamps_ns
       images:                    # optional; null means auto-detect image members
         cameras.front: images.front_1
-      annotations: false         # parse the "annotations" member into attrs
+      annotations: false         # attach the "annotations" member to attrs
       start: 0
       stop: null
       stride: 1
       decode_images: true        # false hands back raw encoded bytes
 
 Both mappings are ``source -> zarr member name``.  A source is the key used by
-the YAML mapping (``features.*.source``), so the two layers stay independent:
-renaming a source here does not rename the member, and vice versa.
+the YAML mapping (``features.*.source``), so renaming a source here never
+renames the stored member.
 
 Numeric members keep their stored dtype; add an ``astype`` transform in the
-mapping if LeRobot expects a different dtype.  Image members are decoded lazily
-to ``(H, W, 3)`` uint8, one frame at a time, so a long episode is never held in
-memory.  Group attributes are attached to every record as ``record["attrs"]``.
+mapping when LeRobot expects something else.  Images are decoded one frame at
+a time, so a long episode is never held in memory.  Group attributes are
+attached to every record as ``record["attrs"]``.
 
-The group's ``attrs.total_frames`` is advisory: the frame count is taken from
-the selected arrays, because real EgoVerse samples can disagree with it.
+``attrs.total_frames`` is advisory: the frame count comes from the selected
+arrays, because real EgoVerse samples can disagree with it.
 """
 
 from __future__ import annotations
 
 import io
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -55,21 +54,23 @@ import numpy as np
 
 from .base import EpisodeReader
 
+# Feature dtypes declared in the group's ``features`` attribute.
 _IMAGE_DTYPES = {"jpeg", "jpg", "png", "image", "video", "webp"}
 _JSON_DTYPES = {"json", "annotation_v1", "annotations"}
 
+# Internal stream kinds returned by ``_classify``.
 _NUMERIC = "numeric"
 _IMAGE = "image"
-
-
-@dataclass(frozen=True)
-class _Stream:
-    source: str
-    member: str
-    kind: str
+_ANNOTATION = "annotation"
 
 
 class EgoEgoverseReader(EpisodeReader):
+    """Read one EgoVerse Zarr v3 sub-dataset as a stream of frames.
+
+    The group is opened read-only and every member is read lazily by row, so
+    memory use is bounded by one frame regardless of episode length.
+    """
+
     kind = "ego_egoverse"
 
     def __init__(
@@ -83,6 +84,12 @@ class EgoEgoverseReader(EpisodeReader):
         stride: int = 1,
         decode_images: bool = True,
     ):
+        """Validate and store the reader settings.
+
+        ``arrays`` and ``images`` map mapping-layer source names to zarr
+        member names.  ``None`` means "auto-detect from the group members";
+        an empty mapping means "use none".
+        """
         if start < 0:
             raise ValueError("reader.start must be >= 0")
         if stop is not None and stop <= start:
@@ -103,8 +110,11 @@ class EgoEgoverseReader(EpisodeReader):
             if overlap:
                 raise ValueError(f"reader source names used twice: {sorted(overlap)}")
 
+    # --------------------------------------------------------------- contract
+
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "EgoEgoverseReader":
+        """Build a reader from the ``reader:`` section of a pipeline config."""
         allowed = {
             "type",
             "arrays",
@@ -129,9 +139,10 @@ class EgoEgoverseReader(EpisodeReader):
         )
 
     def describe(self) -> dict[str, Any]:
+        """Return a JSON-serialisable snapshot of the reader settings."""
         return {
             "type": self.kind,
-            # None means "auto-detect"; an empty mapping means "use none".
+            # None means "auto-detect"; {} means "use none".
             "arrays": None if self.arrays is None else dict(self.arrays),
             "images": None if self.images is None else dict(self.images),
             "annotations": self.annotations,
@@ -141,16 +152,13 @@ class EgoEgoverseReader(EpisodeReader):
             "decode_images": self.decode_images,
         }
 
-    # ------------------------------------------------------------------ checks
-
     def accepts_input(self, path: str | Path) -> bool:
         """Only accept group roots, not Zarr array nodes.
 
-        Every Zarr v3 array directory also contains a ``zarr.json``, so the
-        ``**/zarr.json`` discovery glob matches member nodes too.  A group
-        root has ``"node_type": "group"``; an array node has ``"array"``.
+        Every Zarr v3 array directory also contains a ``zarr.json``, so a
+        ``**/zarr.json`` glob matches member nodes too.  Only the group root
+        has ``"node_type": "group"``.
         """
-
         path = Path(path)
         if path.name != "zarr.json":
             return False
@@ -161,30 +169,18 @@ class EgoEgoverseReader(EpisodeReader):
         return payload.get("node_type") == "group"
 
     def validate(self, path: str | Path) -> None:
-        base = self._base(path)
-        _require_zarr(base)
-        group = _open_group(base)
-
-        streams = self._resolve_streams(group)
-        lengths = self._lengths(group, streams)
-        _check_lengths(lengths, base)
-
-    # ------------------------------------------------------------------ frames
+        """Raise if the episode cannot be read with these settings."""
+        self._prepare(path)
 
     def iter_frames(self, path: str | Path) -> Iterator[dict[str, Any]]:
-        base = self._base(path)
-        _require_zarr(base)
-        group = _open_group(base)
-
-        streams = self._resolve_streams(group)
-        lengths = self._lengths(group, streams)
-        total = _check_lengths(lengths, base)
+        """Yield ``{"frame_index", "attrs", <source>: value}`` once per frame."""
+        group, streams, total = self._prepare(path)
 
         attrs = _to_jsonable(group.attrs)
         if self.annotations:
-            annotations = _load_annotations(group)
-            if annotations is not None:
-                attrs["annotations"] = annotations
+            loaded = _load_annotations(group)
+            if loaded is not None:
+                attrs["annotations"] = loaded
 
         stop = total if self.stop is None else min(self.stop, total)
         if self.start >= stop:
@@ -192,87 +188,76 @@ class EgoEgoverseReader(EpisodeReader):
                 f"empty frame range: start={self.start} stop={stop} total={total}"
             )
 
-        nodes = {stream.source: group[stream.member] for stream in streams}
         for index in range(self.start, stop, self.stride):
             record: dict[str, Any] = {"frame_index": index, "attrs": attrs}
-            for stream in streams:
-                node = nodes[stream.source]
-                if stream.kind == _IMAGE:
+            for source, (node, kind) in streams.items():
+                if kind == _IMAGE:
                     value = node[index]
-                    record[stream.source] = (
-                        _decode_image(value, stream.source)
+                    record[source] = (
+                        _decode_image(value, source)
                         if self.decode_images
-                        else _raw_image(value)
+                        else _unwrap(value)
                     )
-                elif getattr(node, "ndim", None) == 0:
-                    # A scalar member is constant for every frame.
-                    record[stream.source] = np.array(node[()], copy=True)
                 else:
-                    record[stream.source] = np.array(node[index], copy=True)
+                    record[source] = _read_numeric_row(node, index)
             yield record
 
-    # ----------------------------------------------------------------- helpers
+    # ---------------------------------------------------------------- helpers
 
-    @staticmethod
-    def _base(path: str | Path) -> Path:
-        """Accept either the episode directory or its ``zarr.json`` anchor."""
+    def _prepare(self, path: str | Path) -> tuple[Any, dict[str, tuple[Any, str]], int]:
+        """Open the episode and return ``(group, streams, frame_count)``.
 
-        path = Path(path).expanduser()
-        if path.is_file():
-            if path.name != "zarr.json":
-                raise ValueError(f"expected a zarr.json anchor or group directory: {path}")
-            return path.parent
-        return path
+        Both ``validate()`` and ``iter_frames()`` go through here, so they
+        always apply exactly the same checks.
+        """
+        base = _episode_dir(path)
+        group = _open_group(base)
+        streams = self._resolve(group)
+        return group, streams, _frame_count(streams, base)
 
-    def _resolve_streams(self, group: Any) -> list[_Stream]:
-        specs = _feature_specs(group)
-        auto_arrays: dict[str, str] = {}
-        auto_images: dict[str, str] = {}
+    def _resolve(self, group: Any) -> dict[str, tuple[Any, str]]:
+        """Return ``{source: (array_node, kind)}`` for this episode.
 
+        Explicit ``arrays``/``images`` win; a ``None`` section is filled by
+        scanning the group: encoded/object members become images, every other
+        array becomes a numeric stream, and ``annotations`` is skipped because
+        it is not a per-frame stream.
+        """
+        raw_specs = group.attrs.get("features")
+        specs = dict(raw_specs) if isinstance(raw_specs, Mapping) else {}
+
+        detected: dict[str, dict[str, str]] = {_NUMERIC: {}, _IMAGE: {}}
         for name, node in group.members():
             if getattr(node, "shape", None) is None:
                 continue  # nested group, not a feature
             kind = _classify(name, node, specs.get(name))
-            if kind == "annotation":
-                continue
-            if kind == _IMAGE:
-                auto_images[name] = name
-            else:
-                auto_arrays[name] = name
+            if kind in detected:
+                detected[kind][name] = name
 
-        arrays = auto_arrays if self.arrays is None else dict(self.arrays)
-        images = auto_images if self.images is None else dict(self.images)
+        arrays = detected[_NUMERIC] if self.arrays is None else self.arrays
+        images = detected[_IMAGE] if self.images is None else self.images
 
-        streams: dict[str, _Stream] = {}
-        for source, member in arrays.items():
-            _require_array(group, member, source)
-            streams[source] = _Stream(source, member, _NUMERIC)
+        streams = {
+            source: (_member_node(group, member, source), _NUMERIC)
+            for source, member in arrays.items()
+        }
         for source, member in images.items():
             if source in streams:
                 raise ValueError(f"reader source {source!r} is defined twice")
-            _require_array(group, member, source)
-            streams[source] = _Stream(source, member, _IMAGE)
+            streams[source] = (_member_node(group, member, source), _IMAGE)
 
         if not streams:
             raise ValueError(
                 "no streams selected; add reader.arrays/reader.images or check the group members"
             )
-        return list(streams.values())
-
-    @staticmethod
-    def _lengths(group: Any, streams: list[_Stream]) -> dict[str, int | None]:
-        lengths: dict[str, int | None] = {}
-        for stream in streams:
-            node = group[stream.member]
-            shape = getattr(node, "shape", None) or ()
-            lengths[stream.source] = int(shape[0]) if shape else None
-        return lengths
+        return streams
 
 
 # --------------------------------------------------------------------- helpers
 
 
 def _parse_mapping(name: str, raw: Any) -> dict[str, str] | None:
+    """Validate a ``source -> member`` mapping from the config."""
     if raw is None:
         return None
     if not isinstance(raw, Mapping):
@@ -287,32 +272,38 @@ def _parse_mapping(name: str, raw: Any) -> dict[str, str] | None:
     return parsed
 
 
-def _require_zarr(base: Path) -> None:
-    if not (base / "zarr.json").is_file():
-        raise FileNotFoundError(f"not an EgoVerse Zarr group (missing zarr.json): {base}")
-    try:
-        import zarr  # noqa: F401
-    except ImportError as exc:  # pragma: no cover - depends on env
-        raise ImportError("zarr is required for the ego_egoverse reader") from exc
+def _episode_dir(path: str | Path) -> Path:
+    """Return the episode directory for a group dir or its ``zarr.json``."""
+    path = Path(path).expanduser()
+    if path.is_file():
+        if path.name != "zarr.json":
+            raise ValueError(f"expected a zarr.json anchor or group directory: {path}")
+        return path.parent
+    return path
 
 
 def _open_group(base: Path) -> Any:
-    import zarr
+    """Open ``base`` as a read-only Zarr group.
 
+    The anchor is checked first so a wrong path fails with a clear message,
+    and zarr is imported lazily to keep this module importable without it.
+    """
+    if not (base / "zarr.json").is_file():
+        raise FileNotFoundError(f"not an EgoVerse Zarr group (missing zarr.json): {base}")
+    try:
+        import zarr
+    except ImportError as exc:  # pragma: no cover - depends on env
+        raise ImportError("zarr is required for the ego_egoverse reader") from exc
     return zarr.open_group(base, mode="r")
 
 
-def _feature_specs(group: Any) -> dict[str, Any]:
-    specs = group.attrs.get("features")
-    return dict(specs) if isinstance(specs, Mapping) else {}
-
-
 def _classify(name: str, node: Any, spec: Any) -> str:
+    """Decide whether a member is an annotation, an image or numeric data."""
     dtype = ""
     if isinstance(spec, Mapping):
         dtype = str(spec.get("dtype") or "").lower()
     if name == "annotations" or dtype in _JSON_DTYPES:
-        return "annotation"
+        return _ANNOTATION
     if dtype in _IMAGE_DTYPES or name.startswith("images.") or ".images." in name:
         return _IMAGE
     if getattr(node, "dtype", None) is not None and node.dtype.kind == "O":
@@ -321,7 +312,8 @@ def _classify(name: str, node: Any, spec: Any) -> str:
     return _NUMERIC
 
 
-def _require_array(group: Any, member: str, source: str) -> None:
+def _member_node(group: Any, member: str, source: str) -> Any:
+    """Fetch a member array, failing with a readable error on a wrong name."""
     try:
         node = group[member]
     except KeyError as exc:
@@ -330,25 +322,38 @@ def _require_array(group: Any, member: str, source: str) -> None:
         ) from exc
     if getattr(node, "shape", None) is None:
         raise TypeError(f"reader source {source!r}: {member!r} is a group, not an array")
+    return node
 
 
-def _check_lengths(lengths: Mapping[str, int | None], base: Path) -> int:
-    timed = {source: length for source, length in lengths.items() if length is not None}
-    if not timed:
+def _frame_count(streams: Mapping[str, tuple[Any, str]], base: Path) -> int:
+    """Return the episode length, requiring all time-indexed streams to agree."""
+    lengths = {}
+    for source, (node, _) in streams.items():
+        shape = getattr(node, "shape", None) or ()
+        if shape:
+            lengths[source] = int(shape[0])
+
+    if not lengths:
         raise ValueError(f"no time-indexed streams in {base}")
-    distinct = set(timed.values())
+    distinct = set(lengths.values())
     if len(distinct) > 1:
-        detail = ", ".join(f"{source}:{length}" for source, length in timed.items())
+        detail = ", ".join(f"{source}:{length}" for source, length in lengths.items())
         raise ValueError(f"streams disagree on frame count in {base} ({detail})")
+
     total = next(iter(distinct))
     if total <= 0:
         raise ValueError(f"empty episode: {base}")
     return total
 
 
-def _unwrap(value: Any) -> Any:
-    """Zarr 3 scalar selection of a vlen array wraps bytes in a 0-d object array."""
+def _read_numeric_row(node: Any, index: int) -> np.ndarray:
+    """Return one numeric row as a copy; a 0-d member is constant per frame."""
+    value = node[()] if getattr(node, "ndim", None) == 0 else node[index]
+    return np.array(value, copy=True)
 
+
+def _unwrap(value: Any) -> Any:
+    """Unwrap zarr 3's 0-d object array around variable-length bytes."""
     while isinstance(value, np.ndarray) and value.ndim == 0:
         value = value.item()
     if isinstance(value, np.bytes_):
@@ -357,6 +362,7 @@ def _unwrap(value: Any) -> Any:
 
 
 def _decode_image(value: Any, source: str) -> np.ndarray:
+    """Decode one encoded frame (or an HWC/CHW array) to ``(H, W, 3)`` uint8."""
     from PIL import Image
 
     value = _unwrap(value)
@@ -378,12 +384,8 @@ def _decode_image(value: Any, source: str) -> np.ndarray:
     )
 
 
-def _raw_image(value: Any) -> Any:
-    value = _unwrap(value)
-    return value if isinstance(value, (bytes, bytearray, np.ndarray)) else np.asarray(value)
-
-
 def _load_annotations(group: Any) -> list[Any] | None:
+    """Load the ``annotations`` member as parsed JSON (``None`` if absent)."""
     try:
         node = group["annotations"]
     except KeyError:
@@ -391,11 +393,8 @@ def _load_annotations(group: Any) -> list[Any] | None:
     if getattr(node, "shape", None) is None:
         return None
 
-    raw = node[:]
-    if getattr(raw, "size", 0) == 0:
-        return []
     values: list[Any] = []
-    for item in raw:
+    for item in node[:]:
         item = _unwrap(item)
         if isinstance(item, str):
             try:
@@ -407,6 +406,7 @@ def _load_annotations(group: Any) -> list[Any] | None:
 
 
 def _to_jsonable(value: Any) -> Any:
+    """Convert zarr attrs (numpy scalars/arrays, bytes) into JSON-safe values."""
     if isinstance(value, Mapping):
         return {str(key): _to_jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

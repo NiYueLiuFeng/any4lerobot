@@ -854,3 +854,13 @@ python -m ego2lerobot convert \
 - 文件发现与 task 构建：`common/discovery.py:237`、`convert/run.py:56`
 - 可直接参考的非 h5/mcap 读取示例（Zarr）：`demo/egoverse_demo.py`
 - 示例配置：`configs/ego_h5.yaml`、`configs/ego_mcap.yaml`、`configs/ego_egoverse.yaml`
+
+
+## demo代码测试
+
+```
+DEFAULT_EGOVERSE_ROOT = Path("/mnt/cloudrobo/sfs_turbo_wam/cloudrobo-wam/tmp")
+DEFAULT_SUB_DATASET = "2025-09-20-17-42-51-000000"
+
+python -m ego2lerobot.demo.egoverse_demo --max-frames 5 --show-frame 0
+```
