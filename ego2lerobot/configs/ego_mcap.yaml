@@ -1,0 +1,64 @@
+# Example pipeline for MCAP ego episodes (ROS 2 messages).
+#
+# Required decoder (install one):
+#   pip install mcap-ros2-support     # preferred for ROS 2
+#   pip install rosbags               # ROS 1 + ROS 2
+#
+# Run:
+#   python -m ego2lerobot convert -c ego2lerobot/configs/ego_mcap.yaml \
+#       --root /data/ego_mcap --ray-address auto --workers 16 --aggregate
+
+version: 1
+
+repo_id: ego/ego_mcap_demo
+output_root: /tmp/ego_mcap_demo/output
+fps: 30
+robot_type: ego
+
+task:
+  default: ego manipulation
+
+features:
+  observation.state:
+    dtype: float32
+    shape: [7]
+    source: proprio.qpos
+    transforms:
+      - op: astype
+        dtype: float32
+
+  action:
+    dtype: float32
+    shape: [7]
+    source: proprio.cmd
+
+  observation.images.head:
+    dtype: image
+    shape: [480, 640, 3]
+    source: cameras.head.data
+    transforms:
+      - op: as_image
+        dtype: uint8
+        channel_order: HWC   # ROS Image.data is already HWC
+
+reader:
+  type: mcap
+  topics:
+    proprio.qpos: /joint_states
+    proprio.cmd: /cmd_vel_commands
+    cameras.head: /camera/image_raw
+  fields:
+    proprio.qpos: position
+    proprio.cmd: data
+    cameras.head: data
+  sync:
+    mode: nearest      # nearest | hold | exact
+    max_gap_s: 0.1
+    reference: proprio.qpos
+  start_s: null
+  stop_s: null
+  stride: 1
+
+writer:
+  use_videos: false
+  image_writer_threads: 4

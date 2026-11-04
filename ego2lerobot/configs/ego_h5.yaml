@@ -1,0 +1,63 @@
+# Example pipeline for HDF5 ego episodes.
+#
+# This file is the single source of truth for:
+#   * how source fields are named (reader.arrays)
+#   * how they map to LeRobot features (features)
+#   * where the output goes (repo_id / output_root)
+#
+# Run:
+#   python -m ego2lerobot convert -c ego2lerobot/configs/ego_h5.yaml \
+#       --root /data/ego --ray-address auto --workers 16 --aggregate
+
+version: 1
+
+repo_id: ego/ego_demo
+output_root: /tmp/ego_h5_demo/output
+fps: 30
+robot_type: ego
+
+# The task string becomes LeRobot's "task" column.  It is a constant here;
+# use `source: attrs.instruction` if every episode carries its own instruction.
+task:
+  source: attrs.instruction
+  default: ego manipulation
+
+features:
+  observation.state:
+    dtype: float32
+    shape: [7]
+    source: proprio.qpos
+
+  action:
+    dtype: float32
+    shape: [7]
+    source: proprio.cmd
+    # Example: values are stored in milli-units.
+    # transforms:
+    #   - op: scale
+    #     factor: 0.001
+
+  observation.images.head:
+    dtype: image
+    shape: [64, 96, 3]
+    source: cameras.head
+    transforms:
+      - op: as_image
+        dtype: uint8
+        channel_order: HWC
+
+reader:
+  type: h5
+  time_axis: 0
+  # Every key is the source name used above; the value is the dataset path.
+  arrays:
+    proprio.qpos: /observations/qpos
+    proprio.cmd: /action
+    cameras.head: /observations/images/head
+  attrs: true
+
+writer:
+  # `use_videos: true` requires a working ffmpeg + libsvtav1; PNG frames are a
+  # safer default for debugging and small datasets.
+  use_videos: false
+  image_writer_threads: 2

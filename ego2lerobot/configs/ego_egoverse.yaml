@@ -1,0 +1,120 @@
+# Example pipeline for EgoVerse (Zarr v3) episodes.
+#
+# One sub-dataset directory is one episode, and its zarr.json is the unique
+# discovery anchor:
+#
+#   2025-09-20-17-42-51-000000/
+#     zarr.json                 # embodiment / fps / task_name / features
+#     right.obs_ee_pose/        # (T, 7) float64
+#     left.obs_ee_pose/         # (T, 7) float64
+#     obs_head_pose/            # (T, 7) float64
+#     obs_eye_gaze/             # (T, 3) float64
+#     obs_rgb_timestamps_ns/    # (T,) int64
+#     images.front_1/           # (T,) variable-length JPEG bytes
+#
+# Run:
+#   python -m ego2lerobot convert -c ego2lerobot/configs/ego_egoverse.yaml \
+#       --root /path/to/egoverse --include '**/zarr.json' \
+#       --ray-address auto --workers 8 --aggregate
+
+version: 1
+
+repo_id: ego/egoverse_demo
+output_root: /tmp/ego_egoverse_demo/output
+fps: 30                      # must match the sub-dataset's attrs.fps
+robot_type: ego_egoverse
+
+task:
+  source: attrs.task_description
+  default: ego manipulation
+
+features:
+  # Single-arm state for the example.  For bimanual data, concatenate left +
+  # right (see the note in reader.arrays below) or add a composed source.
+  observation.state:
+    dtype: float32
+    shape: [7]
+    source: obs.ee_pose_right
+    transforms:
+      - op: astype
+        dtype: float32
+
+  # Ego data often has no action.  This example writes an explicit zero action
+  # so LeRobotDataset can be created.  Replace it with a real action stream if
+  # your downstream policy needs one.
+  action:
+    dtype: float32
+    shape: [7]
+    default: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    transforms:
+      - op: astype
+        dtype: float32
+
+  observation.images.front_1:
+    dtype: image
+    shape: [480, 640, 3]
+    source: cameras.front
+    transforms:
+      - op: as_image
+        dtype: uint8
+        channel_order: HWC
+
+  observation.ee_pose_left:
+    dtype: float32
+    shape: [7]
+    source: obs.ee_pose_left
+    transforms:
+      - op: astype
+        dtype: float32
+
+  observation.ee_pose_right:
+    dtype: float32
+    shape: [7]
+    source: obs.ee_pose_right
+    transforms:
+      - op: astype
+        dtype: float32
+
+  observation.head_pose:
+    dtype: float32
+    shape: [7]
+    source: obs.head_pose
+    transforms:
+      - op: astype
+        dtype: float32
+
+  observation.eye_gaze:
+    dtype: float32
+    shape: [3]
+    source: obs.eye_gaze
+    transforms:
+      - op: astype
+        dtype: float32
+
+reader:
+  type: ego_egoverse
+
+  # source -> zarr member name.  Set `arrays: null` to auto-detect every
+  # numeric member; an explicit mapping keeps source names stable and avoids
+  # loading large unused arrays.
+  arrays:
+    obs.ee_pose_left: left.obs_ee_pose
+    obs.ee_pose_right: right.obs_ee_pose
+    obs.head_pose: obs_head_pose
+    obs.eye_gaze: obs_eye_gaze
+    obs.timestamps_ns: obs_rgb_timestamps_ns
+
+  # Set `images: null` to auto-detect image members (name starts with
+  # "images." or the feature dtype is jpeg/png/image/video).
+  images:
+    cameras.front: images.front_1
+
+  annotations: false         # true -> parse into attrs["annotations"]
+  start: 0
+  stop: null
+  stride: 1
+  decode_images: true        # false -> hand back raw encoded bytes
+
+writer:
+  use_videos: false
+  image_writer_threads: 2
