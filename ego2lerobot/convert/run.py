@@ -1,7 +1,13 @@
-"""Driver utilities: discovery -> tasks -> Ray -> optional aggregation.
+"""Driver utilities for the conversion pipeline.
 
-These functions are intentionally free of CLI concerns so they can be called
-from a notebook or a scheduler.
+The driver is a sequence of small, CLI-free stages so it can also be called
+from a notebook or a scheduler::
+
+    plan_conversion()      # discover raw files -> one ConversionTask per file
+    make_executor_config() # describe the Ray runtime (imports, preflight, ...)
+    run_conversion()       # submit pending tasks, skip committed ones
+    write_run_summary()    # JSON report for logs and downstream tooling
+    aggregate()            # merge per-task LeRobot datasets into one dataset
 """
 
 from __future__ import annotations
@@ -11,11 +17,18 @@ import json
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 
-from ego2lerobot.common import ConversionTask, RayExecutor, RayExecutorConfig, TaskResult
+from ego2lerobot.common import (
+    ConversionTask,
+    RayExecutor,
+    RayExecutorConfig,
+    TaskResult,
+    summarize_results,
+)
 from ego2lerobot.common.discovery import (
     DEFAULT_EXCLUDE,
     DiscoveredFile,
@@ -29,21 +42,41 @@ from ego2lerobot.common.state import SUCCESS_MARKER, is_task_done, partial_path
 from ego2lerobot.config import PipelineConfig
 
 
+# ---------------------------------------------------------------------------
+# File globs and Ray preflight imports per reader kind
+# ---------------------------------------------------------------------------
+
+# Each reader has an anchor file that identifies one episode.  For EgoVerse,
+# an episode is a Zarr v3 group whose anchor is ``zarr.json``.
+_READER_INCLUDES: dict[str, tuple[str, ...]] = {
+    "h5": ("**/*.h5", "**/*.hdf5", "**/*.hdf"),
+    "mcap": ("**/*.mcap",),
+    "ego_egoverse": ("**/zarr.json",),
+}
+
+# Extra imports every Ray node must provide before a run starts.
+_READER_PREFLIGHT_IMPORTS: dict[str, tuple[str, ...]] = {
+    "h5": ("h5py",),
+    # Decoding is lazy, but every node needs these when a task starts.
+    "ego_egoverse": ("zarr", "PIL"),
+}
+
+
 def reader_includes(pipeline: PipelineConfig) -> tuple[str, ...]:
     """Default file globs derived from the configured reader."""
 
-    if pipeline.reader.kind == "h5":
-        return ("**/*.h5", "**/*.hdf5", "**/*.hdf")
-    if pipeline.reader.kind == "mcap":
-        return ("**/*.mcap",)
-    if pipeline.reader.kind == "ego_egoverse":
-        # One sub-dataset (episode) has exactly one zarr.json anchor.
-        return ("**/zarr.json",)
-    return ("**/*",)
+    return _READER_INCLUDES.get(pipeline.reader.kind, ("**/*",))
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: planning - discovery -> tasks
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class ConversionPlan:
+    """Discovered inputs plus the tasks built from them."""
+
     files: list[DiscoveredFile]
     tasks: list[ConversionTask]
     roots: list[Path] = field(default_factory=list)
@@ -68,7 +101,7 @@ def plan_conversion(
     max_files: int | None = None,
     manifest_path: str | Path | None = None,
 ) -> ConversionPlan:
-    """Discover files and build one task per file."""
+    """Discover raw files and build one conversion task per file."""
 
     discovery = DiscoveryConfig(
         roots=list(roots),
@@ -108,26 +141,19 @@ def build_tasks(
     tasks: list[ConversionTask] = []
 
     for item in files:
+        # Prefix the relative path with a root label when several roots are
+        # scanned, so files from different roots stay distinguishable.
         label = root_labels[item.root]
         relative = f"{label}/{item.relative_path}" if label else item.relative_path
-        key = PurePosixPath(relative).with_suffix("").as_posix()
         digest = hashlib.sha1(relative.encode("utf-8")).hexdigest()[:10]
-        output = build_output_path(
-            DiscoveredFile(
-                path=item.path,
-                root=item.root,
-                relative_path=relative,
-                size=item.size,
-                mtime=item.mtime,
-                inode=item.inode,
-            ),
-            output_root,
-        )
+        task_id = f"{PurePosixPath(relative).with_suffix('').as_posix()}-{digest}"
+        output_path = build_output_path(replace(item, relative_path=relative), output_root)
+
         tasks.append(
             ConversionTask(
-                task_id=f"{key}-{digest}",
+                task_id=task_id,
                 input_path=item.path,
-                output_path=output,
+                output_path=output_path,
                 metadata={
                     "relative_path": relative,
                     "root": str(item.root),
@@ -145,19 +171,26 @@ def build_tasks(
 
 
 def _root_labels(files: Sequence[DiscoveredFile]) -> dict[Path, str]:
+    """Give each discovery root a stable prefix for task/output names."""
+
     roots = sorted({item.root for item in files}, key=str)
-    counts: dict[str, int] = {}
-    for root in roots:
-        counts[root.name] = counts.get(root.name, 0) + 1
+    counts = Counter(root.name for root in roots)
+
     labels: dict[Path, str] = {}
     for index, root in enumerate(roots):
         if len(roots) == 1:
             labels[root] = ""
         elif counts[root.name] > 1:
+            # Two roots share a basename: disambiguate with a position suffix.
             labels[root] = f"{root.name}-{index}"
         else:
             labels[root] = root.name
     return labels
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: execution - configure Ray and submit pending tasks
+# ---------------------------------------------------------------------------
 
 
 def make_executor_config(
@@ -176,14 +209,14 @@ def make_executor_config(
     working_dir: str | Path | None = None,
     shutdown_after_run: bool = True,
 ) -> RayExecutorConfig:
-    output_root = Path(output_root)
+    """Describe the Ray runtime used for one conversion run."""
 
-    imports = ["ego2lerobot", "lerobot"]
-    if pipeline.reader.kind == "h5":
-        imports.append("h5py")
-    elif pipeline.reader.kind == "ego_egoverse":
-        # Decoding is lazy, but every node must have these before the run.
-        imports.extend(["zarr", "PIL"])
+    output_root = Path(output_root)
+    imports = [
+        "ego2lerobot",
+        "lerobot",
+        *_READER_PREFLIGHT_IMPORTS.get(pipeline.reader.kind, ()),
+    ]
 
     return RayExecutorConfig(
         address=ray_address,
@@ -220,40 +253,38 @@ def run_conversion(
     preflight_ffmpeg: bool = False,
     working_dir: str | Path | None = None,
 ) -> tuple[list[TaskResult], RayExecutor]:
-    """Submit all tasks that are not already committed."""
+    """Submit every task that is not already committed."""
 
     from ego2lerobot.convert.worker import process_batch
 
     output_root = Path(output_root or pipeline.output_root)
 
-    # Skip already-finished tasks on the driver: this keeps the in-flight
-    # window full of real work instead of trivial "skipped" results.
-    pending = [task for task in plan.tasks if not is_task_done(task)]
-    skipped = [
-        TaskResult(
-            task_id=task.task_id,
-            status="skipped",
-            output_path=str(task.output_path),
-        )
-        for task in plan.tasks
-        if is_task_done(task)
-    ]
+    # Partition on the driver: finished tasks never reach Ray, which keeps the
+    # in-flight window full of real work instead of trivial "skipped" results.
+    pending: list[ConversionTask] = []
+    skipped: list[TaskResult] = []
+    for task in plan.tasks:
+        if is_task_done(task):
+            skipped.append(_skipped_result(task))
+        else:
+            pending.append(task)
 
-    executor_config = make_executor_config(
-        pipeline=pipeline,
-        plan=plan,
-        output_root=output_root,
-        ray_address=ray_address,
-        cpus_per_task=cpus_per_task,
-        gpus_per_task=gpus_per_task,
-        workers=workers,
-        tasks_per_job=tasks_per_job,
-        max_retries=max_retries,
-        preflight=preflight,
-        preflight_ffmpeg=preflight_ffmpeg,
-        working_dir=working_dir,
+    executor = RayExecutor(
+        make_executor_config(
+            pipeline=pipeline,
+            plan=plan,
+            output_root=output_root,
+            ray_address=ray_address,
+            cpus_per_task=cpus_per_task,
+            gpus_per_task=gpus_per_task,
+            workers=workers,
+            tasks_per_job=tasks_per_job,
+            max_retries=max_retries,
+            preflight=preflight,
+            preflight_ffmpeg=preflight_ffmpeg,
+            working_dir=working_dir,
+        )
     )
-    executor = RayExecutor(executor_config)
 
     if pending:
         results = executor.run(
@@ -262,20 +293,18 @@ def run_conversion(
             {"config_path": str(Path(config_path).expanduser().resolve())},
         )
     else:
-        executor.last_summary = {
-            "total": 0,
-            "ok": 0,
-            "skipped": 0,
-            "failed": 0,
-            "episodes": 0,
-            "frames": 0,
-            "task_elapsed_s": 0.0,
-            "wall_elapsed_s": 0.0,
-        }
+        executor.last_summary = {**summarize_results([]), "wall_elapsed_s": 0.0}
         results = []
 
-    merged = _merge_results(plan.tasks, results, skipped)
-    return merged, executor
+    return _merge_results(plan.tasks, results, skipped), executor
+
+
+def _skipped_result(task: ConversionTask) -> TaskResult:
+    return TaskResult(
+        task_id=task.task_id,
+        status="skipped",
+        output_path=str(task.output_path),
+    )
 
 
 def _merge_results(
@@ -283,21 +312,26 @@ def _merge_results(
     results: Sequence[TaskResult],
     skipped: Sequence[TaskResult],
 ) -> list[TaskResult]:
-    by_id = {result.task_id: result for result in [*skipped, *results]}
+    """Return one result per task in plan order, flagging missing results."""
+
+    by_id = {result.task_id: result for result in (*skipped, *results)}
     merged: list[TaskResult] = []
     for task in tasks:
-        merged.append(
-            by_id.get(
-                task.task_id,
-                TaskResult(
-                    task_id=task.task_id,
-                    status="failed",
-                    output_path=str(task.output_path),
-                    error="no result for task",
-                ),
+        result = by_id.get(task.task_id)
+        if result is None:
+            result = TaskResult(
+                task_id=task.task_id,
+                status="failed",
+                output_path=str(task.output_path),
+                error="no result for task",
             )
-        )
+        merged.append(result)
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: reporting - write a machine-readable run summary
+# ---------------------------------------------------------------------------
 
 
 def write_run_summary(
@@ -308,46 +342,51 @@ def write_run_summary(
     *,
     wall_elapsed_s: float | None = None,
 ) -> dict[str, Any]:
-    from ego2lerobot.common.types import summarize_results
+    """Write the run report atomically and return its payload."""
 
     summary = summarize_results(results)
     if wall_elapsed_s is not None:
         summary["wall_elapsed_s"] = wall_elapsed_s
+
     payload = {
         "generated_at": time.time(),
         "config": pipeline.describe(),
         "discovery": plan.summary(),
         "summary": summary,
-        "episode_order": [
-            {
-                "task_id": result.task_id,
-                "output_path": result.output_path,
-                "frames": result.frames,
-            }
-            for result in results
-            if result.status == "ok"
-        ],
-        "skipped": [
-            {
-                "task_id": result.task_id,
-                "output_path": result.output_path,
-                "frames": result.frames,
-            }
-            for result in results
-            if result.status == "skipped"
-        ],
+        "episode_order": _result_rows(results, "ok"),
+        "skipped": _result_rows(results, "skipped"),
         "failures": [
             {"task_id": result.task_id, "error": result.error}
             for result in results
             if result.status == "failed"
         ],
     }
+
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, target)
     return payload
+
+
+def _result_rows(results: Sequence[TaskResult], status: str) -> list[dict[str, Any]]:
+    """Compact task rows for the ``ok`` and ``skipped`` report sections."""
+
+    return [
+        {
+            "task_id": result.task_id,
+            "output_path": result.output_path,
+            "frames": result.frames,
+        }
+        for result in results
+        if result.status == status
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: aggregation - merge committed per-task datasets
+# ---------------------------------------------------------------------------
 
 
 def committed_roots(results: Sequence[TaskResult]) -> list[Path]:
@@ -384,12 +423,13 @@ def aggregate(
         return None
 
     target = Path(output_root or pipeline.aggregate_output_root)
-    marker = target / SUCCESS_MARKER
-    if marker.is_file() and not force:
+    if (target / SUCCESS_MARKER).is_file() and not force:
         return target
 
     from lerobot.datasets.aggregate import aggregate_datasets
 
+    # Build into ``<target>.partial`` and swap it into place only after the
+    # success marker is written, so a crash never leaves a half-merged dataset.
     partial = partial_path(target)
     shutil.rmtree(partial, ignore_errors=True)
     # aggregate_datasets() creates aggr_root itself and requires it to be absent.
@@ -402,8 +442,7 @@ def aggregate(
         aggr_root=partial,
     )
 
-    marker_tmp = partial / SUCCESS_MARKER
-    marker_tmp.write_text(
+    (partial / SUCCESS_MARKER).write_text(
         json.dumps(
             {
                 "datasets": len(roots),
