@@ -264,35 +264,20 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
     )
 
 
+def _task_spec(**kwargs: Any) -> FeatureSpec:
+    """``task`` is a LeRobot metadata field, not a dataset feature."""
+
+    return FeatureSpec(name="task", dtype="string", shape=(1,), **kwargs)
+
+
 def _parse_task(raw: Any) -> FeatureSpec:
     if raw is None:
-        return FeatureSpec(
-            name="task",
-            dtype="string",
-            shape=(1,),
-            sources=(),
-            default="convert",
-            required=False,
-        )
+        return _task_spec(sources=(), default="convert", required=False)
     if isinstance(raw, str):
-        return FeatureSpec(
-            name="task",
-            dtype="string",
-            shape=(1,),
-            sources=(),
-            default=raw,
-            required=False,
-        )
+        return _task_spec(sources=(), default=raw, required=False)
     if isinstance(raw, dict):
-        prepared = dict(raw)
-        prepared.setdefault("dtype", "string")
-        prepared.setdefault("shape", [1])
-        spec = _parse_feature("task", prepared)
-        # ``task`` is a LeRobot metadata field, not a dataset feature.
-        return FeatureSpec(
-            name="task",
-            dtype="string",
-            shape=(1,),
+        spec = _parse_feature("task", {"dtype": "string", "shape": [1], **raw})
+        return _task_spec(
             sources=spec.sources,
             default=spec.default,
             required=spec.required,

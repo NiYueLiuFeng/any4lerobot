@@ -122,17 +122,26 @@ class H5Reader(EpisodeReader):
         import h5py
 
         with h5py.File(path, "r") as handle:
-            for item in self.arrays:
-                if item.path not in handle:
-                    raise KeyError(f"dataset {item.path!r} not found in {path}")
-                if not isinstance(handle[item.path], h5py.Dataset):
-                    raise TypeError(f"{item.path!r} in {path} is a group, not a dataset")
-                dataset = handle[item.path]
-                axis = self.time_axis if item.axis is None else item.axis
+            datasets = self._datasets(handle, h5py, path)
+            for item, (_, dataset, axis_override) in zip(self.arrays, datasets):
+                axis = self.time_axis if axis_override is None else axis_override
                 if dataset.ndim > 0 and (axis >= dataset.ndim or axis < -dataset.ndim):
                     raise IndexError(
                         f"{item.path!r} has shape {dataset.shape}; axis {axis} is invalid"
                     )
+
+    def _datasets(self, handle: Any, h5py: Any, path: Path) -> list[tuple[str, Any, int | None]]:
+        """Resolve every configured dataset, with a readable error on a miss."""
+
+        resolved: list[tuple[str, Any, int | None]] = []
+        for item in self.arrays:
+            if item.path not in handle:
+                raise KeyError(f"dataset {item.path!r} not found in {path}")
+            dataset = handle[item.path]
+            if not isinstance(dataset, h5py.Dataset):
+                raise TypeError(f"{item.path!r} in {path} is a group, not a dataset")
+            resolved.append((item.source, dataset, item.axis))
+        return resolved
 
     def iter_frames(self, path: str | Path) -> Iterator[dict[str, Any]]:
         import h5py
@@ -140,15 +149,7 @@ class H5Reader(EpisodeReader):
 
         path = Path(path)
         with h5py.File(path, "r") as handle:
-            datasets: list[tuple[str, Any, int | None]] = []
-            for item in self.arrays:
-                if item.path not in handle:
-                    raise KeyError(f"dataset {item.path!r} not found in {path}")
-                dataset = handle[item.path]
-                if not isinstance(dataset, h5py.Dataset):
-                    raise TypeError(f"{item.path!r} in {path} is a group, not a dataset")
-                datasets.append((item.source, dataset, item.axis))
-
+            datasets = self._datasets(handle, h5py, path)
             frame_attrs = _decode_attrs(handle.attrs) if self.attrs else None
 
             lengths: list[int] = []
@@ -201,10 +202,7 @@ def _take(dataset: Any, index: int, axis_override: int | None, default_axis: int
 
 
 def _decode_attrs(attrs: Any) -> dict[str, Any]:
-    decoded: dict[str, Any] = {}
-    for key, value in attrs.items():
-        decoded[str(key)] = _decode_value(value)
-    return decoded
+    return {str(key): _decode_value(value) for key, value in attrs.items()}
 
 
 def _decode_value(value: Any) -> Any:

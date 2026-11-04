@@ -63,6 +63,15 @@ class PipelineConfigError(ValueError):
     """Raised when a pipeline configuration file is invalid."""
 
 
+def _optional_mapping(value: Any, name: str) -> dict[str, Any]:
+    """Return a shallow copy of an optional config section."""
+
+    value = value or {}
+    if not isinstance(value, dict):
+        raise PipelineConfigError(f"{name} must be a mapping")
+    return dict(value)
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     mapping: MappingConfig
@@ -129,13 +138,8 @@ class PipelineConfig:
         except Exception as exc:
             raise PipelineConfigError(f"invalid reader: {exc}") from exc
 
-        writer = payload.get("writer") or {}
-        if not isinstance(writer, dict):
-            raise PipelineConfigError("writer must be a mapping")
-
-        aggregate = payload.get("aggregate") or {}
-        if not isinstance(aggregate, dict):
-            raise PipelineConfigError("aggregate must be a mapping")
+        writer = _optional_mapping(payload.get("writer"), "writer")
+        aggregate = _optional_mapping(payload.get("aggregate"), "aggregate")
         unknown_aggregate = set(aggregate) - {"repo_id", "output_root"}
         if unknown_aggregate:
             raise PipelineConfigError(f"unknown aggregate keys: {sorted(unknown_aggregate)}")
@@ -145,8 +149,8 @@ class PipelineConfig:
             reader=reader,
             repo_id=repo_id.strip(),
             output_root=Path(output_root).expanduser(),
-            writer=dict(writer),
-            aggregate=dict(aggregate),
+            writer=writer,
+            aggregate=aggregate,
             source_path=source_path,
         )
 

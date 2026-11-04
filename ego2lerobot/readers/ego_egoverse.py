@@ -262,14 +262,12 @@ def _parse_mapping(name: str, raw: Any) -> dict[str, str] | None:
         return None
     if not isinstance(raw, Mapping):
         raise ValueError(f"reader.{name} must be a mapping or null")
-    parsed: dict[str, str] = {}
     for source, member in raw.items():
         if not isinstance(source, str) or not source:
             raise ValueError(f"reader.{name} keys must be non-empty strings")
         if not isinstance(member, str) or not member:
             raise ValueError(f"reader.{name}[{source!r}] must be a non-empty string")
-        parsed[source] = member
-    return parsed
+    return dict(raw)
 
 
 def _episode_dir(path: str | Path) -> Path:

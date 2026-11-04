@@ -76,6 +76,11 @@ class McapReader(EpisodeReader):
             raise ValueError("reader.decoder must be auto, mcap_ros2 or rosbags")
 
         self.topics = dict(topics)
+        # Reverse lookup for the topic name emitted by the decoder.  First
+        # configured source wins if several map to the same topic.
+        self._sources_by_topic: dict[str, str] = {}
+        for name, topic in self.topics.items():
+            self._sources_by_topic.setdefault(topic, name)
         self.fields = dict(fields or {})
         self.sync = sync
         self.max_gap_s = max_gap_s
@@ -195,10 +200,7 @@ class McapReader(EpisodeReader):
             )
 
     def _name_for_topic(self, topic: str) -> str | None:
-        for name, configured in self.topics.items():
-            if configured == topic:
-                return name
-        return None
+        return self._sources_by_topic.get(topic)
 
 
 def _pick(samples: list[_Sample], times: list[float], t: float, mode: str) -> _Sample | None:

@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from ego2lerobot.common.types import TaskResult
 from ego2lerobot.config import PipelineConfig, PipelineConfigError
 from ego2lerobot.convert.run import (
     ConversionPlan,
@@ -167,54 +168,66 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+def _results_from_summary(summary_path: Path) -> list[TaskResult]:
+    """Rebuild task results from a ``write_run_summary`` report."""
+
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    results = [
+        TaskResult(
+            task_id=item["task_id"],
+            status="ok",
+            episodes=1,
+            frames=int(item.get("frames", 0)),
+            output_path=item["output_path"],
+        )
+        for item in payload.get("episode_order", [])
+    ]
+    for item in payload.get("skipped", []):
+        if isinstance(item, dict):
+            results.append(
+                TaskResult(
+                    task_id=item.get("task_id", ""),
+                    status="skipped",
+                    frames=int(item.get("frames", 0)),
+                    output_path=item.get("output_path", ""),
+                )
+            )
+        else:
+            results.append(TaskResult(task_id=str(item), status="skipped"))
+    return results
+
+
+def _scan_committed(output_root: Path) -> list[TaskResult]:
+    """Fallback: find datasets that carry ``_SUCCESS`` and LeRobot metadata."""
+
+    results: list[TaskResult] = []
+    for marker in sorted(output_root.rglob("_SUCCESS")):
+        dataset_root = marker.parent
+        if (dataset_root / "meta" / "info.json").is_file():
+            results.append(
+                TaskResult(
+                    task_id=str(dataset_root.relative_to(output_root)),
+                    status="ok",
+                    episodes=1,
+                    output_path=str(dataset_root),
+                )
+            )
+    return results
+
+
 def _cmd_aggregate(args: argparse.Namespace) -> int:
     pipeline = PipelineConfig.load(args.config)
     output_root = Path(args.output_root or pipeline.output_root)
 
-    from ego2lerobot.common.types import TaskResult
-
     summary_path = args.summary or output_root / "_run_summary.json"
-    results: list[TaskResult] = []
     if summary_path.is_file():
-        payload = json.loads(summary_path.read_text(encoding="utf-8"))
-        for item in payload.get("episode_order", []):
-            results.append(
-                TaskResult(
-                    task_id=item["task_id"],
-                    status="ok",
-                    episodes=1,
-                    frames=int(item.get("frames", 0)),
-                    output_path=item["output_path"],
-                )
-            )
-        for item in payload.get("skipped", []):
-            if isinstance(item, dict):
-                results.append(
-                    TaskResult(
-                        task_id=item.get("task_id", ""),
-                        status="skipped",
-                        frames=int(item.get("frames", 0)),
-                        output_path=item.get("output_path", ""),
-                    )
-                )
-            else:
-                results.append(TaskResult(task_id=str(item), status="skipped"))
+        results = _results_from_summary(summary_path)
     else:
         print(
             f"[aggregate] {summary_path} not found; scanning {output_root} for committed datasets",
             file=sys.stderr,
         )
-        for marker in sorted(output_root.rglob("_SUCCESS")):
-            dataset_root = marker.parent
-            if (dataset_root / "meta" / "info.json").is_file():
-                results.append(
-                    TaskResult(
-                        task_id=str(dataset_root.relative_to(output_root)),
-                        status="ok",
-                        episodes=1,
-                        output_path=str(dataset_root),
-                    )
-                )
+        results = _scan_committed(output_root)
 
     if args.engine == "ray-data":
         from ego2lerobot.convert.aggregate_raydata import (
@@ -293,11 +306,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    # Older scopes used ``args.aggregate_output`` only in convert; make the
-    # attribute available to both commands without duplicating parser code.
-    if not hasattr(args, "aggregate_output"):
-        args.aggregate_output = None
 
     try:
         return args.func(args)
