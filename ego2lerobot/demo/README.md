@@ -245,7 +245,9 @@ fps / episodes / frames / features；退出码 0 表示 `ok` 或 `skipped`，
 
 - 已有的 `_SUCCESS` 会让重复运行直接 `skipped`；`--overwrite` 才会删除重转；
 - `--max-frames` 是帧数，内部换算成 reader 的 `stop = start + max_frames * stride`；
-- 只想检查原始数据时不要加 `--to-lerobot`，那条路径不会写任何文件。
+- 只想检查原始数据时不要加 `--to-lerobot`，那条路径不会写任何文件；
+- 输出目录不支持 `rename(2)` 时（例如华为 SFS Turbo 的某些导出会返回 `EPERM`），
+  `staging_path()` 会直接往最终目录写，`_SUCCESS` 仍是唯一的完成标记，不会多复制一份数据。
 
 核心 API：
 
@@ -356,10 +358,10 @@ def _process_one(task, config):
     try:
         # 1) 读取：根据 task.input_path 后缀选择 h5 或 mcap reader
         # 2) 映射：按配置把源字段映射成 LeRobot features
-        # 3) 写入：root 必须用 partial_path(task.output_path)，不要直接写 task.output_path
-        #    LeRobotDataset.create(root=partial_path(task.output_path), ...)
+        # 3) 写入：root 用 staging_path(task)，由它决定临时目录还是最终目录
+        #    LeRobotDataset.create(root=staging_path(task), ...)
         #    dataset.add_frame(...); dataset.save_episode(); dataset.finalize()
-        # 4) finalize 后调用 commit_output(task) 原子重命名并写 _SUCCESS
+        # 4) finalize 后调用 commit_output(task) 提交并写 _SUCCESS
         ...
     except TransientIOError:
         raise          # 交给 Ray 重试（max_retries）

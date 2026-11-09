@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import time
 from collections import Counter
@@ -38,7 +37,13 @@ from ego2lerobot.common.discovery import (
     summarize_discovery,
     write_manifest,
 )
-from ego2lerobot.common.state import SUCCESS_MARKER, is_task_done, partial_path
+from ego2lerobot.common.state import (
+    SUCCESS_MARKER,
+    is_task_done,
+    move_into_place,
+    staging_directory,
+    write_text_atomic,
+)
 from ego2lerobot.config import PipelineConfig
 
 
@@ -362,11 +367,7 @@ def write_run_summary(
         ],
     }
 
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, target)
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return payload
 
 
@@ -430,19 +431,20 @@ def aggregate(
 
     # Build into ``<target>.partial`` and swap it into place only after the
     # success marker is written, so a crash never leaves a half-merged dataset.
-    partial = partial_path(target)
-    shutil.rmtree(partial, ignore_errors=True)
+    # On file systems without rename the staging directory *is* the target and
+    # _SUCCESS is the completion signal.
+    staging = staging_directory(target)
+    shutil.rmtree(staging, ignore_errors=True)
     # aggregate_datasets() creates aggr_root itself and requires it to be absent.
-    partial.parent.mkdir(parents=True, exist_ok=True)
 
     aggregate_datasets(
         repo_ids=[pipeline.repo_id] * len(roots),
         aggr_repo_id=repo_id or pipeline.aggregate_repo_id,
         roots=roots,
-        aggr_root=partial,
+        aggr_root=staging,
     )
 
-    (partial / SUCCESS_MARKER).write_text(
+    (staging / SUCCESS_MARKER).write_text(
         json.dumps(
             {
                 "datasets": len(roots),
@@ -455,10 +457,8 @@ def aggregate(
         encoding="utf-8",
     )
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        shutil.rmtree(target)
-    os.replace(partial, target)
+    if staging != target:
+        move_into_place(staging, target)
     return target
 
 

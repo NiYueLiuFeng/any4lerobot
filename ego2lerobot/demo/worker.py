@@ -15,8 +15,8 @@ from typing import Any
 from ego2lerobot.common.state import (
     commit_output,
     is_task_done,
-    partial_path,
     prepare_output,
+    staging_path,
     write_failure,
     write_task_log,
 )
@@ -68,14 +68,15 @@ def _process_one(task: ConversionTask, config: dict[str, Any]) -> TaskResult:
             "host": host,
         }
 
-        partial = partial_path(task.output_path)
-        partial.mkdir(parents=True, exist_ok=True)
-        (partial / "result.json").write_text(
+        staging = staging_path(task)
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / "result.json").write_text(
             json.dumps(result, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 
-        # Atomic commit: <output>.partial -> <output>, then write _SUCCESS.
+        # Commit: <output>.partial -> <output> where rename works, then
+        # write _SUCCESS.  staging_path picks the portable layout.
         commit_output(task)
 
         elapsed = round(time.perf_counter() - started, 3)
@@ -93,7 +94,10 @@ def _process_one(task: ConversionTask, config: dict[str, Any]) -> TaskResult:
         # Data errors are returned, not raised: one bad file must not kill the
         # whole batch or trigger endless Ray retries.  Transient IO errors can
         # be re-raised in a real worker to let Ray retry them.
-        write_failure(task, traceback.format_exc())
+        try:
+            write_failure(task, traceback.format_exc())
+        except OSError:
+            pass
         write_task_log(log_dir, task, "failed", error=f"{type(exc).__name__}: {exc}")
         return TaskResult(
             task_id=task.task_id,

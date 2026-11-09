@@ -880,3 +880,10 @@ fps / episodes / frames / features。
 - `--stride N`：每 N 帧取一帧；
 - `--overwrite`：删除已提交的产物重转；不加时重复运行返回 `skipped`；
 - `--output-root` / `--repo-id` / `--config`：覆盖输出位置、repo_id、pipeline 配置。
+
+输出目录被指定为 `--output-root` 本身时，数据集仍会落在它下面的
+`<sub-dataset>-<hash>/`。提交阶段默认用 `os.replace` 把 `.partial` 原子
+改名成最终目录；如果目标文件系统拒绝 `rename(2)`（例如华为 SFS Turbo 的
+部分导出会返回 `EPERM`，即使文件是当前用户刚创建的），`staging_path()`
+会改为直接写最终目录，`_SUCCESS` 作为唯一的完成标记，避免再复制一份
+GB 级数据。

@@ -39,7 +39,6 @@ Constraints
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -51,7 +50,11 @@ from ego2lerobot.common.ray_executor import (
     build_runtime_env,
     resolve_address,
 )
-from ego2lerobot.common.state import SUCCESS_MARKER, partial_path
+from ego2lerobot.common.state import (
+    SUCCESS_MARKER,
+    move_into_place,
+    staging_directory,
+)
 from ego2lerobot.common.types import TaskResult
 from ego2lerobot.config import PipelineConfig
 
@@ -118,18 +121,19 @@ def aggregate_with_ray_data(
             "use the lerobot backend"
         )
 
-    partial = partial_path(target)
-    shutil.rmtree(partial, ignore_errors=True)
+    # <target>.partial normally; the target itself on file systems without
+    # rename, where _SUCCESS is the completion signal.
+    staging = staging_directory(target)
+    shutil.rmtree(staging, ignore_errors=True)
     # LeRobotDatasetMetadata.create() creates the root itself and requires it
     # to be absent, so only the parent is created here.
-    partial.parent.mkdir(parents=True, exist_ok=True)
 
     dst_meta = LeRobotDatasetMetadata.create(
         repo_id=repo_id or pipeline.aggregate_repo_id,
         fps=fps,
         robot_type=robot_type,
         features=features,
-        root=partial,
+        root=staging,
         use_videos=False,
     )
 
@@ -142,7 +146,7 @@ def aggregate_with_ray_data(
         metas,
         pipeline.repo_id,
         unique_tasks,
-        partial,
+        staging,
         DEFAULT_DATA_PATH,
         DEFAULT_EPISODES_PATH,
     )
@@ -166,7 +170,7 @@ def aggregate_with_ray_data(
 
     finalize_aggregation(dst_meta, metas)
 
-    marker = partial / SUCCESS_MARKER
+    marker = staging / SUCCESS_MARKER
     marker.write_text(
         json.dumps(
             {
@@ -182,10 +186,8 @@ def aggregate_with_ray_data(
         encoding="utf-8",
     )
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        shutil.rmtree(target)
-    os.replace(partial, target)
+    if staging != target:
+        move_into_place(staging, target)
     return target
 
 

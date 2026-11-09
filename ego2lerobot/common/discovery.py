@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
+from .state import write_text_atomic
+
 DEFAULT_INCLUDE = (
     "**/*.h5",
     "**/*.hdf5",
@@ -308,9 +310,7 @@ def write_manifest(path: str | Path, files: Sequence[DiscoveredFile]) -> Path:
             for item in files
         ],
     }
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, target)
+    write_text_atomic(target, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return target
 
 

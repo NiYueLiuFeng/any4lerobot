@@ -20,12 +20,17 @@ from .ray_executor import (
 from .state import (
     commit_output,
     is_task_done,
+    move_into_place,
     partial_path,
     prepare_output,
+    rename_supported,
     safe_name,
+    staging_directory,
+    staging_path,
     success_marker,
     write_failure,
     write_task_log,
+    write_text_atomic,
 )
 from .types import ConversionTask, TaskResult, summarize_results
 
@@ -43,15 +48,20 @@ __all__ = [
     "commit_output",
     "discover_files",
     "is_task_done",
+    "move_into_place",
     "partial_path",
     "prepare_output",
     "read_manifest",
+    "rename_supported",
     "resolve_address",
     "safe_name",
+    "staging_directory",
+    "staging_path",
     "summarize_discovery",
     "summarize_results",
     "success_marker",
     "write_failure",
     "write_manifest",
     "write_task_log",
+    "write_text_atomic",
 ]

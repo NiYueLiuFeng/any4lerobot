@@ -22,8 +22,8 @@ from typing import Any
 from ego2lerobot.common.state import (
     commit_output,
     is_task_done,
-    partial_path,
     prepare_output,
+    staging_path,
     write_failure,
     write_task_log,
 )
@@ -97,21 +97,24 @@ def process_task(
 
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-        partial = partial_path(task.output_path)
+        # <output>.partial normally; <output> itself on file systems where
+        # rename(2) is rejected and the atomic swap is impossible.
+        staging = staging_path(task)
         # LeRobotDataset.create() requires a non-existing root and creates it
-        # itself, so do not pre-create the partial directory here.
-        partial.parent.mkdir(parents=True, exist_ok=True)
+        # itself, so do not pre-create the staging directory here.
 
         dataset = LeRobotDataset.create(
             repo_id=pipeline.repo_id,
             fps=pipeline.fps,
             features=pipeline.mapping.lerobot_features(),
-            root=partial,
+            root=staging,
             robot_type=pipeline.mapping.robot_type,
             **pipeline.writer_kwargs(),
         )
 
-        for record in pipeline.reader.iter_frames(task.input_path):
+        from tqdm import tqdm
+
+        for record in tqdm(pipeline.reader.iter_frames(task.input_path)):
             frame = pipeline.mapping.resolve(record)
             task_text = frame.get("task")
             if not isinstance(task_text, str) or not task_text:
@@ -125,7 +128,7 @@ def process_task(
         dataset.save_episode()
         dataset.finalize()
 
-        _write_conversion_meta(task, pipeline, partial, frames)
+        _write_conversion_meta(task, pipeline, staging, frames)
 
         # Atomic commit: <output>.partial -> <output>, then write _SUCCESS.
         commit_output(task)
@@ -142,14 +145,20 @@ def process_task(
             host=host,
         )
     except Exception as exc:
-        # Release file handles and async image writers.  The partial directory
+        error = traceback.format_exc()
+        # Release file handles and async image writers.  The staged directory
         # is not committed and is removed on the next attempt.
         if dataset is not None:
             try:
                 dataset.finalize()
             except Exception:
                 pass
-        write_failure(task, traceback.format_exc())
+        try:
+            write_failure(task, error)
+        except OSError:
+            # A filesystem that cannot even record failures must not hide the
+            # conversion error returned below.
+            pass
         write_task_log(log_dir, task, "failed", error=f"{type(exc).__name__}: {exc}")
         return TaskResult(
             task_id=task.task_id,
@@ -164,7 +173,7 @@ def process_task(
 
 
 def _write_conversion_meta(
-    task: ConversionTask, pipeline: PipelineConfig, partial: Path, frames: int
+    task: ConversionTask, pipeline: PipelineConfig, staging: Path, frames: int
 ) -> None:
     """Record how this dataset was produced; harmless extra file in the root."""
 
@@ -179,7 +188,7 @@ def _write_conversion_meta(
         "reader": pipeline.reader.describe(),
         "host": socket.gethostname(),
     }
-    (partial / "_conversion.json").write_text(
+    (staging / "_conversion.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )

@@ -284,6 +284,100 @@ class ReaderAndWorkerTest(unittest.TestCase):
         self.assertFalse(is_task_done(task))
         self.assertTrue((self.output / "broken.failed.json").is_file())
 
+    def test_worker_writes_directly_when_rename_is_rejected(self) -> None:
+        """SFS/NFS exports without rename(2) must still commit a dataset."""
+
+        from unittest import mock
+
+        from ego2lerobot.common import state
+        from ego2lerobot.convert.worker import process_batch
+
+        task = ConversionTask(
+            task_id="no_rename",
+            input_path=self.h5_path,
+            output_path=self.output / "no_rename",
+        )
+        with mock.patch.object(state, "rename_supported", return_value=False):
+            results = process_batch([task], {"config_path": str(self.config_path)})
+
+        self.assertEqual(results[0].status, "ok", results[0].error)
+        self.assertTrue(state.is_task_done(task))
+        self.assertFalse(state.partial_path(task.output_path).exists())
+        self.assertTrue((Path(task.output_path) / "_conversion.json").is_file())
+
+
+class StateTest(unittest.TestCase):
+    """Commit behaviour on file systems that reject rename(2)."""
+
+    def setUp(self) -> None:
+        from ego2lerobot.common import state
+
+        self.state = state
+        state._RENAME_SUPPORT.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.output = self.root / "out"
+
+    def tearDown(self) -> None:
+        self.state._RENAME_SUPPORT.clear()
+        self.tmp.cleanup()
+
+    def _task(self, name: str = "episode") -> ConversionTask:
+        return ConversionTask(name, self.root / f"{name}.h5", self.output / name)
+
+    def test_staging_path_uses_partial_when_rename_works(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(self.state, "rename_supported", return_value=True):
+            staging = self.state.staging_path(self._task())
+        self.assertEqual(staging, self.state.partial_path(self.output / "episode"))
+
+    def test_staging_path_uses_final_when_rename_is_rejected(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(self.state, "rename_supported", return_value=False):
+            staging = self.state.staging_path(self._task())
+        self.assertEqual(staging, self.output / "episode")
+        self.assertTrue(self.output.is_dir())
+
+    def test_commit_marks_direct_output_successful(self) -> None:
+        task = self._task("direct")
+        task.output_path.mkdir(parents=True)
+        (task.output_path / "result.json").write_text("{}", encoding="utf-8")
+
+        self.state.commit_output(task)
+
+        self.assertTrue(self.state.is_task_done(task))
+        self.assertTrue((task.output_path / "result.json").is_file())
+
+    def test_commit_copies_when_replace_fails(self) -> None:
+        from unittest import mock
+
+        task = self._task("copy")
+        partial = self.state.partial_path(task.output_path)
+        partial.mkdir(parents=True)
+        (partial / "result.json").write_text("{}", encoding="utf-8")
+
+        denied = PermissionError(1, "Operation not permitted")
+        with mock.patch.object(self.state.os, "replace", side_effect=denied):
+            self.state.commit_output(task)
+
+        self.assertTrue(self.state.is_task_done(task))
+        self.assertTrue((task.output_path / "result.json").is_file())
+        self.assertFalse(partial.exists())
+
+    def test_write_failure_falls_back_without_replace(self) -> None:
+        from unittest import mock
+
+        task = self._task("broken")
+        denied = PermissionError(1, "Operation not permitted")
+        with mock.patch.object(self.state.os, "replace", side_effect=denied):
+            path = self.state.write_failure(task, "boom")
+
+        self.assertTrue(path.is_file())
+        self.assertIn("boom", path.read_text(encoding="utf-8"))
+        self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
 
 class PipelineConfigTest(unittest.TestCase):
     def test_example_configs_load(self) -> None:
