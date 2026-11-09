@@ -212,6 +212,41 @@ python -m ego2lerobot.demo.egoverse_demo \
   --root /path/to/egoverse --sub-dataset 2025-09-20-17-42-51-000000 --json
 ```
 
+把一集子数据集真正转换成 LeRobot 数据集（复用了生产链路的
+`PipelineConfig` + `convert/worker.py`，不是另写一份写盘逻辑）：
+
+```bash
+# 转换前 5 帧；默认写到 config 的 output_root 下
+python -m ego2lerobot.demo.egoverse_demo --to-lerobot --max-frames 5 --overwrite
+
+# 指定输出位置 / repo_id / 帧窗口
+python -m ego2lerobot.demo.egoverse_demo --to-lerobot \
+  --sub-dataset 2025-09-20-17-42-51-000000 \
+  --config ego2lerobot/configs/ego_egoverse.yaml \
+  --output-root /tmp/ego_lerobot_demo \
+  --repo-id ego/egoverse_demo \
+  --stride 1 --max-frames 5 --overwrite
+```
+
+产物（默认位置，即 `ego_egoverse.yaml` 的 `output_root`）：
+
+```text
+/tmp/ego_egoverse_demo/output/
+  2025-09-20-17-42-51-000000-<hash>/
+    _SUCCESS                  # 原子提交标记；重跑时任务直接 skipped
+    meta/info.json            # fps / features / total_frames
+    data/... parquet
+    images/...                # writer.use_videos=false 时的 PNG 帧
+```
+
+脚本转换完成后会用 `LeRobotDataset(repo_id, root=...)` 读回产物并打印
+fps / episodes / frames / features；退出码 0 表示 `ok` 或 `skipped`，
+1 表示失败。
+
+- 已有的 `_SUCCESS` 会让重复运行直接 `skipped`；`--overwrite` 才会删除重转；
+- `--max-frames` 是帧数，内部换算成 reader 的 `stop = start + max_frames * stride`；
+- 只想检查原始数据时不要加 `--to-lerobot`，那条路径不会写任何文件。
+
 核心 API：
 
 ```python

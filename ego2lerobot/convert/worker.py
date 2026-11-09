@@ -60,15 +60,24 @@ def process_batch(batch: list[ConversionTask], config: dict[str, Any]) -> list[T
     if not config_path:
         raise ValueError("worker config is missing 'config_path'")
     pipeline = load_pipeline_config(config_path)
-    return [_process_one(task, pipeline, config) for task in batch]
+    log_dir = (config.get("_executor") or {}).get("log_dir")
+    return [process_task(task, pipeline, log_dir=log_dir) for task in batch]
 
 
-def _process_one(
-    task: ConversionTask, pipeline: PipelineConfig, config: dict[str, Any]
+def process_task(
+    task: ConversionTask,
+    pipeline: PipelineConfig,
+    *,
+    log_dir: str | Path | None = None,
 ) -> TaskResult:
+    """Convert one task with an already-loaded pipeline.
+
+    ``process_batch`` is the Ray entry point and reloads the config from disk.
+    This variant takes the in-memory pipeline, so demos and notebooks can tweak
+    the reader window or output root without writing a temporary config file.
+    """
     started = time.perf_counter()
     host = socket.gethostname()
-    log_dir = (config.get("_executor") or {}).get("log_dir")
 
     if is_task_done(task):
         write_task_log(log_dir, task, "skipped")
@@ -176,4 +185,4 @@ def _write_conversion_meta(
     )
 
 
-__all__ = ["load_pipeline_config", "process_batch"]
+__all__ = ["load_pipeline_config", "process_batch", "process_task"]

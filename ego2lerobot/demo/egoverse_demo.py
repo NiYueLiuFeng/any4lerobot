@@ -25,8 +25,11 @@ kept lazy by default (a 2900-frame 640x480 dataset is ~2.6 GB decoded); pass
 1. ``EgoVerseReader``：打开一个 Zarr v3 group，把成员分成数值流、图像流和
    标注流；数值数组只加载选中的帧，图像保持懒加载、按需解码。
 2. ``generate_egoverse_demo``：对外入口，解析路径后构造 reader，并打印摘要。
-3. ``parse_args`` / ``main``：命令行封装，支持 ``--json``、``--show-frame``
-   两种检查方式。
+3. ``convert_to_lerobot``：把一集子数据集写成真正的 LeRobot 数据集，复用
+   生产链路（PipelineConfig + worker.process_task），产出可直接用
+   ``LeRobotDataset(repo_id, root=...)`` 读取的目录。
+4. ``parse_args`` / ``main``：命令行封装，支持 ``--to-lerobot`` 转换以及
+   ``--json``、``--show-frame`` 两种检查方式。
 
 Run from the repository root::
 
@@ -35,6 +38,13 @@ Run from the repository root::
     # inspect one real sub-dataset without loading every image
     python -m ego2lerobot.demo.egoverse_demo \
         --sub-dataset 2025-09-20-17-42-51-000000 --max-frames 5 --show-frame 0
+
+    # convert one sub-dataset into a LeRobot dataset
+    python -m ego2lerobot.demo.egoverse_demo --to-lerobot \
+        --sub-dataset 2025-09-20-17-42-51-000000 --max-frames 5
+
+The converted dataset is written to ``<output_root>/<sub-dataset>-<hash>`` and
+is verified by reopening it with ``LeRobotDataset`` before the script returns.
 """
 
 from __future__ import annotations
@@ -44,9 +54,14 @@ import io
 import json
 import sys
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 import numpy as np
+
+if TYPE_CHECKING:
+    # 仅用于类型标注；运行时不导入，保持检查模式的启动开销不变。
+    from ego2lerobot.common.types import ConversionTask, TaskResult
+    from ego2lerobot.config import PipelineConfig
 
 # 把仓库根目录加入 sys.path，保证脚本被直接执行时也能 import ego2lerobot。
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -57,6 +72,8 @@ if str(REPO_ROOT) not in sys.path:
 DEFAULT_EGOVERSE_ROOT = Path("/mnt/cloudrobo/sfs_turbo_wam/cloudrobo-wam/tmp")
 #: 默认读取的子数据集：一个目录就是一集。
 DEFAULT_SUB_DATASET = "2025-09-20-17-42-51-000000"
+#: 转换模式使用的 pipeline 配置（reader + 字段映射 + writer 参数）。
+DEFAULT_PIPELINE_CONFIG = REPO_ROOT / "ego2lerobot" / "configs" / "ego_egoverse.yaml"
 
 # group attrs 里 features.<name>.dtype 的取值，用来判断成员类别。
 _IMAGE_DTYPES = {"jpeg", "jpg", "png", "image", "video"}
@@ -500,6 +517,158 @@ def _print_summary(reader: EgoVerseReader, *, stream: Any = None) -> None:
         print(f"  warning: {warning}", file=stream)
 
 
+def convert_to_lerobot(
+    sub_dataset: str | Path = DEFAULT_SUB_DATASET,
+    *,
+    root: str | Path | None = DEFAULT_EGOVERSE_ROOT,
+    config: str | Path = DEFAULT_PIPELINE_CONFIG,
+    output_root: str | Path | None = None,
+    repo_id: str | None = None,
+    stride: int = 1,
+    max_frames: int | None = None,
+    overwrite: bool = False,
+    verbose: bool = True,
+) -> "TaskResult":
+    """Convert one EgoVerse sub-dataset into a LeRobot dataset.
+
+    中文：把一集子数据集真正转换成 LeRobot 格式。复用生产链路
+    ``PipelineConfig -> reader -> mapping -> LeRobotDataset -> 原子提交``，
+    只是把配置换成内存对象，方便在调试器里单集运行；产物与
+    ``python -m ego2lerobot convert`` 完全一致。
+
+    参数：
+        sub_dataset: 子数据集名字（在 root 下查找）或直接给目录路径。
+        root: 子数据集根目录，仅在 sub_dataset 是名字时使用。
+        config: pipeline 配置，决定 reader、字段映射和 writer 行为。
+        output_root: 输出根目录；None 表示用配置里的 output_root。
+        repo_id: 覆盖配置里的 repo_id，None 表示不覆盖。
+        stride: 帧抽样步长，1 表示逐帧。
+        max_frames: 最多转换多少帧；None 表示整集。
+        overwrite: True 时先删掉已有产物（包括 ``_SUCCESS``）再重转。
+        verbose: 是否打印转换结果和数据集摘要。
+
+    返回：
+        ``TaskResult``（status=ok/skipped/failed、frames、elapsed_s、error）。
+    """
+    import shutil
+    from dataclasses import replace
+
+    from ego2lerobot.config import PipelineConfig
+    from ego2lerobot.convert.worker import process_task
+
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    if max_frames is not None and max_frames <= 0:
+        raise ValueError("max_frames must be > 0 or None")
+
+    path = _resolve_sub_dataset(sub_dataset, root)
+    pipeline = PipelineConfig.load(config)
+    if pipeline.reader.kind != "ego_egoverse":
+        raise ValueError(
+            f"convert_to_lerobot needs an ego_egoverse config, got {pipeline.reader.kind!r}"
+        )
+
+    # 1. 用命令行的 stride / max_frames 覆盖配置里的取帧窗口。
+    pipeline = _with_reader_window(pipeline, stride=stride, max_frames=max_frames)
+    # 2. 应用输出位置和 repo_id 覆盖。
+    if repo_id:
+        pipeline = replace(pipeline, repo_id=repo_id)
+    if output_root is not None:
+        pipeline = replace(pipeline, output_root=Path(output_root).expanduser().resolve())
+
+    # 3. 构造与 CLI 一致的 ConversionTask（相对路径 + 哈希，避免重名）。
+    task = _build_conversion_task(path, pipeline.output_root)
+    if overwrite:
+        # process_task 只会清理未提交的目录；已提交的要先手动删掉。
+        shutil.rmtree(task.output_path, ignore_errors=True)
+    task.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 4. 单集直接调用 worker，避免启动 Ray。
+    result = process_task(task, pipeline)
+
+    if verbose:
+        print(
+            f"[egoverse] -> lerobot status={result.status} frames={result.frames} "
+            f"elapsed={result.elapsed_s}s",
+            flush=True,
+        )
+        print(f"[egoverse] output: {result.output_path}", flush=True)
+        if result.error:
+            print(f"[egoverse] error: {result.error}", flush=True)
+        elif result.status in {"ok", "skipped"}:
+            _print_lerobot_summary(Path(result.output_path), pipeline.repo_id)
+    return result
+
+
+def _with_reader_window(
+    pipeline: "PipelineConfig", *, stride: int, max_frames: int | None
+) -> "PipelineConfig":
+    """Override the reader's frame window with the CLI stride / max_frames.
+
+    中文：``max_frames`` 是「帧数」，reader 的 ``stop`` 是「帧号」，
+    所以换算成 ``start + max_frames * stride`` 才能拿到正好 N 帧。
+    """
+    from dataclasses import replace
+
+    from ego2lerobot.readers import make_reader
+
+    if stride == pipeline.reader.stride and max_frames is None:
+        return pipeline
+
+    settings = dict(pipeline.reader.describe())
+    start = int(settings.get("start") or 0)
+    settings["stride"] = int(stride)
+    if max_frames is not None:
+        settings["stop"] = start + int(max_frames) * int(stride)
+    return replace(pipeline, reader=make_reader(settings))
+
+
+def _build_conversion_task(path: Path, output_root: Path) -> "ConversionTask":
+    """Build the same ``ConversionTask`` the CLI would create for this episode.
+
+    中文：用 ``build_tasks`` 复用生产命名规则，输出目录名带短哈希，
+    同一子数据集重复转换时总是落在同一个位置，便于断点续跑。
+    """
+    from ego2lerobot.common.discovery import DiscoveredFile
+    from ego2lerobot.convert.run import build_tasks
+
+    anchor = path / "zarr.json"
+    if not anchor.is_file():
+        raise FileNotFoundError(f"not an EgoVerse Zarr group (missing zarr.json): {path}")
+
+    stat = anchor.stat()
+    item = DiscoveredFile(
+        path=anchor,
+        root=path.parent,
+        # 用子数据集目录名做相对路径，输出目录更易读（不含 "zarr"）。
+        relative_path=path.name,
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+    )
+    return build_tasks([item], output_root)[0]
+
+
+def _print_lerobot_summary(root: Path, repo_id: str) -> None:
+    """Reopen the converted dataset and print its metadata.
+
+    中文：用 ``LeRobotDataset`` 读回产物，确认帧数、特征和 dtype 都正确。
+    这一步失败说明转换产物不可用，会直接把异常抛给调用方。
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset = LeRobotDataset(repo_id=repo_id, root=root)
+    print(
+        f"[egoverse] dataset repo_id={repo_id} fps={dataset.fps} "
+        f"episodes={dataset.num_episodes} frames={dataset.num_frames}",
+        flush=True,
+    )
+    for name, feature in dataset.features.items():
+        print(
+            f"  feature {name:<32} dtype={feature['dtype']} "
+            f"shape={feature.get('shape')}"
+        )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """定义命令行参数。"""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -510,7 +679,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--load-images", action="store_true")
-    # 输出方式：--json 打印元数据，--show-frame 打印单帧，都不给则打印摘要。
+    # 转换模式：把选中窗口写成真正的 LeRobot 数据集。
+    parser.add_argument(
+        "--to-lerobot",
+        action="store_true",
+        help="convert the sub-dataset into a LeRobot dataset instead of only printing stats",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_PIPELINE_CONFIG,
+        help="pipeline config used by --to-lerobot (default: ego_egoverse.yaml)",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="LeRobot output root; defaults to the config's output_root",
+    )
+    parser.add_argument("--repo-id", default=None, help="override the config's repo_id")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="delete an existing converted dataset before writing",
+    )
+    # 检查模式：--json 打印元数据，--show-frame 打印单帧，都不给则打印摘要。
     parser.add_argument(
         "--show-frame",
         type=int,
@@ -522,9 +715,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """命令行入口：加载数据后按参数选择输出方式。"""
-    # 1. 解析参数并加载子数据集。
+    """命令行入口：按参数选择「转换成 LeRobot」或「读取检查」。"""
     args = parse_args(argv)
+
+    # 1. --to-lerobot：写出 LeRobot 数据集；退出码反映转换是否成功。
+    if args.to_lerobot:
+        result = convert_to_lerobot(
+            args.sub_dataset,
+            root=args.root,
+            config=args.config,
+            output_root=args.output_root,
+            repo_id=args.repo_id,
+            stride=args.stride,
+            max_frames=args.max_frames,
+            overwrite=args.overwrite,
+        )
+        return 0 if result.status in {"ok", "skipped"} else 1
+
+    # 2. 检查模式：加载子数据集并打印摘要。
     reader = generate_egoverse_demo(
         args.sub_dataset,
         root=args.root,
@@ -534,12 +742,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         verbose=not args.json,
     )
 
-    # 2. --json：只输出可序列化的元数据。
+    # 3. --json：只输出可序列化的元数据。
     if args.json:
         print(json.dumps(reader.describe(), ensure_ascii=False, indent=2))
         return 0
 
-    # 3. --show-frame：解码并打印一帧的每个字段。
+    # 4. --show-frame：解码并打印一帧的每个字段。
     if args.show_frame is not None:
         record = reader.frame_at(args.show_frame, decode_images=True)
         print(f"[egoverse] frame {record['frame_index']}:", flush=True)
@@ -548,7 +756,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"  {name:<28} shape={value.shape} dtype={value.dtype}")
             else:
                 print(f"  {name:<28} {value!r}")
-    # 4. 默认：摘要已在 generate_egoverse_demo 中打印，这里直接返回。
+    # 5. 默认：摘要已在 generate_egoverse_demo 中打印，这里直接返回。
     return 0
 
 

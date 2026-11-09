@@ -862,5 +862,21 @@ python -m ego2lerobot convert \
 DEFAULT_EGOVERSE_ROOT = Path("/mnt/cloudrobo/sfs_turbo_wam/cloudrobo-wam/tmp")
 DEFAULT_SUB_DATASET = "2025-09-20-17-42-51-000000"
 
+# 只读取检查：打印统计信息 + 解码第 0 帧
 python -m ego2lerobot.demo.egoverse_demo --max-frames 5 --show-frame 0
+
+# 真正转换成 LeRobot 数据集（产物可直接用 LeRobotDataset 加载）
+python -m ego2lerobot.demo.egoverse_demo --to-lerobot --max-frames 5 --overwrite
 ```
+
+转换模式复用生产链路：`PipelineConfig` + `convert/worker.py` 的
+`process_task()`（读取 → 映射 → `LeRobotDataset` → 原子提交并写 `_SUCCESS`），
+不是另写一套写盘逻辑。产物位置由配置里的 `output_root` 决定（示例为
+`/tmp/ego_egoverse_demo/output/<sub-dataset>-<hash>`），转换完成后脚本会
+用 `LeRobotDataset(repo_id, root=...)` 读回并打印
+fps / episodes / frames / features。
+
+- `--max-frames N`：只转换前 N 帧（reader 内部换算成 `stop`）；
+- `--stride N`：每 N 帧取一帧；
+- `--overwrite`：删除已提交的产物重转；不加时重复运行返回 `skipped`；
+- `--output-root` / `--repo-id` / `--config`：覆盖输出位置、repo_id、pipeline 配置。

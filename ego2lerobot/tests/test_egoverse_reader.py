@@ -241,6 +241,79 @@ class EgoEgoverseReaderTest(unittest.TestCase):
         self.assertEqual(frame["observation.images.front_1"].shape, (4, 4, 3))
         self.assertEqual(frame["observation.images.front_1"].dtype, np.uint8)
 
+    def test_demo_convert_writes_lerobot_dataset(self) -> None:
+        try:
+            import lerobot  # noqa: F401
+        except ImportError as exc:  # pragma: no cover - depends on env
+            self.skipTest(f"lerobot missing: {exc}")
+
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        from ego2lerobot.demo.egoverse_demo import convert_to_lerobot
+
+        config_path = self.root / "demo_pipeline.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "repo_id": "ego/demo",
+                    "output_root": str(self.root / "lerobot"),
+                    "fps": 10,
+                    "robot_type": "ego_egoverse",
+                    "task": {
+                        "source": "attrs.task_description",
+                        "default": "ego manipulation",
+                    },
+                    "features": {
+                        "observation.state": {
+                            "dtype": "float32",
+                            "shape": [7],
+                            "source": "obs.state",
+                            "transforms": [{"op": "astype", "dtype": "float32"}],
+                        },
+                        "action": {
+                            "dtype": "float32",
+                            "shape": [7],
+                            "default": [0.0] * 7,
+                            "transforms": [{"op": "astype", "dtype": "float32"}],
+                        },
+                        "observation.images.front_1": {
+                            "dtype": "image",
+                            "shape": [4, 4, 3],
+                            "source": "cameras.front",
+                            "transforms": [
+                                {"op": "as_image", "dtype": "uint8", "channel_order": "HWC"}
+                            ],
+                        },
+                    },
+                    "reader": {
+                        "type": "ego_egoverse",
+                        "arrays": {"obs.state": "right.obs_ee_pose"},
+                        "images": {"cameras.front": "images.front_1"},
+                    },
+                    "writer": {"use_videos": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = convert_to_lerobot(
+            self.episode,
+            config=config_path,
+            output_root=self.root / "lerobot",
+            max_frames=3,
+            overwrite=True,
+            verbose=False,
+        )
+        self.assertEqual(result.status, "ok", result.error)
+        self.assertEqual(result.frames, 3)
+
+        dataset = LeRobotDataset(repo_id="ego/demo", root=Path(result.output_path))
+        self.assertEqual(dataset.num_frames, 3)
+        self.assertEqual(dataset.num_episodes, 1)
+        item = dataset[0]
+        self.assertEqual(tuple(item["observation.images.front_1"].shape), (3, 4, 4))
+        self.assertEqual(item["task"], "folding clothes")
+
 
 if __name__ == "__main__":
     unittest.main()
