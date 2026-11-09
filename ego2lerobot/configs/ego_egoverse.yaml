@@ -91,6 +91,26 @@ features:
       - op: astype
         dtype: float32
 
+  observation.keypoints_left:
+    dtype: float32
+    shape: [21, 3]
+    source: obs.obs_keypoints_left
+    transforms:
+      - op: reshape
+        shape: [21, 3]
+      - op: astype
+        dtype: float32
+
+  observation.keypoints_right:
+    dtype: float32
+    shape: [21, 3]
+    source: obs.obs_keypoints_right
+    transforms:
+      - op: reshape
+        shape: [21, 3]
+      - op: astype
+        dtype: float32
+
 reader:
   type: ego_egoverse
 
@@ -103,6 +123,8 @@ reader:
     obs.head_pose: obs_head_pose
     obs.eye_gaze: obs_eye_gaze
     obs.timestamps_ns: obs_rgb_timestamps_ns
+    obs.obs_keypoints_left: left.obs_keypoints
+    obs.obs_keypoints_right: right.obs_keypoints
 
   # Set `images: null` to auto-detect image members (name starts with
   # "images." or the feature dtype is jpeg/png/image/video).
