@@ -39,14 +39,16 @@ features:
       - op: astype
         dtype: float32
 
-  # Ego data often has no action.  This example writes an explicit zero action
-  # so LeRobotDataset can be created.  Replace it with a real action stream if
-  # your downstream policy needs one.
+  # Action is the next frame's concatenated left + right end-effector pose:
+  # action[t] = concat(left[t+1], right[t+1]); the last frame reuses its own.
+  # (state_to_action is equivalent to the low-level `lookahead: 1`.)
   action:
     dtype: float32
-    shape: [7]
-    default: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    shape: [14]
+    sources: [obs.ee_pose_left, obs.ee_pose_right]
+    combine: concat
     transforms:
+      - op: state_to_action
       - op: astype
         dtype: float32
 

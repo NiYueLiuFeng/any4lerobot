@@ -112,15 +112,32 @@ def process_task(
             **pipeline.writer_kwargs(),
         )
 
+        from collections import deque
+
         from tqdm import tqdm
 
-        for record in tqdm(pipeline.reader.iter_frames(task.input_path)):
-            frame = pipeline.mapping.resolve(record)
+        # A feature may read a later frame (e.g. action[t] = state[t+1]), so
+        # buffer up to `lookahead` frames before resolving the oldest one.
+        lookahead = pipeline.mapping.max_lookahead
+        window: deque[dict[str, Any]] = deque()
+
+        def emit(record: dict[str, Any], future: tuple[dict[str, Any], ...]) -> None:
+            nonlocal frames
+            frame = pipeline.mapping.resolve(record, future=future)
             task_text = frame.get("task")
             if not isinstance(task_text, str) or not task_text:
                 raise ValueError("mapping produced an empty 'task' value")
             dataset.add_frame(frame)
             frames += 1
+
+        for record in tqdm(pipeline.reader.iter_frames(task.input_path)):
+            window.append(record)
+            while len(window) > lookahead:
+                emit(window.popleft(), tuple(window))
+
+        # The tail has no future records; lookahead features clamp to the last.
+        while window:
+            emit(window.popleft(), tuple(window))
 
         if frames == 0:
             raise ValueError(f"no frames decoded from {task.input_path}")

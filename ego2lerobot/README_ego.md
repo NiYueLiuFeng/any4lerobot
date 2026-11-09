@@ -124,12 +124,16 @@ writer:
 | `required` | 可选 | 默认 `true`；设为 `false` 时缺失会得到 `None` 而不是报错 |
 | `transforms` | 可选 | 按顺序应用的变换列表 |
 | `names` | 可选 | 维度名元信息，原样写入 LeRobot feature |
+| `combine` | 可选 | `first`（默认，候选里第一个存在的胜出）或 `concat`（按声明顺序拼接所有 `sources`） |
+| `lookahead` | 可选 | 非负整数，默认 `0`；`1` 表示源值取自下一帧（`action[t] = state[t+1]`），到结尾钳制到最后一帧 |
 
 约束（加载期就会校验）：
 
 - `dtype` 必须在允许集合内；`shape` 必须是正整数列表；
 - 既没有 `source` 也没有 `default` 且 `required: true` 的 feature 会被拒绝；
 - `source` 和 `sources` 不要同时写；
+- `combine: concat` 必须至少有一个 `source`，且不能同时使用 `default`；
+- `lookahead` 必须是非负整数（`true`/`"1"` 都不接受）；
 - feature 名不能为空。
 
 ### 1.3 `source` 的解析规则
@@ -173,6 +177,7 @@ source: [proprio.cmd, action]    # 候选：先试 proprio.cmd，再试 action
 | `to_bool` | — | 字符串/数值转 bool |
 | `to_string` | — | 转字符串 |
 | `as_image` | `dtype`, `channel_order` | 图像规范化：float 0~1 自动乘 255、裁剪、CHW→HWC、转 uint8 |
+| `state_to_action` | `lookahead`（默认 1） | 时间型指令：源值取自下一帧（`action[t] = state[t+1]`），结尾钳制到最后一帧；由映射层解析，不能单独作用于单个值 |
 
 典型写法：
 
@@ -222,7 +227,32 @@ LeRobot 数据集要求有 `action`。ego 数据如果本身没有动作，需�
 - 相邻状态差分；
 - 显式空 action（固定维度全零），并在数据卡里说明。
 
-`transforms` 目前只能做逐帧的数组运算，**不能引用其它帧**。所以“下一帧状态”这类跨帧构造应在 reader 的 `iter_frames()` 里完成，再以一个新 key（如 `proprio.next_qpos`）输出。
+跨帧构造由 `state_to_action` 完成，不需要改 reader：
+
+```yaml
+action:
+  dtype: float32
+  shape: [7]
+  source: obs.ee_pose_right   # 与 observation.state 同源
+  transforms:
+    - op: state_to_action     # action[t] = state[t+1]；最后一帧复用自身
+    - op: astype
+      dtype: float32
+```
+
+`state_to_action` 是时间型指令，由映射层在选帧时处理，和低层写法 `lookahead: 1` 等价。`convert/worker.py` 会按 `MappingConfig.max_lookahead` 缓存后视窗口，结尾没有未来帧时钳制到最后一帧。
+
+多个字段拼接用 `combine: concat`（按声明顺序、`axis=0`）：
+
+```yaml
+action:
+  dtype: float32
+  shape: [14]
+  sources: [obs.ee_pose_left, obs.ee_pose_right]
+  combine: concat
+```
+
+两种写法可以叠加：`combine: concat` + `state_to_action` 表示拼接**下一帧**的多个字段；拼接后的数组仍可继续走其它 `transforms`（`reshape`、`astype` 等）。
 
 ---
 

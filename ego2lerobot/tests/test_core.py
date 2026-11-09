@@ -167,6 +167,161 @@ class MappingTest(unittest.TestCase):
         )
         self.assertEqual(config.lerobot_features()["x"]["shape"], (3,))
 
+    def test_lookahead_uses_next_record_and_clamps_last(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [2],
+                        "source": "state",
+                        "lookahead": 1,
+                    },
+                },
+            }
+        )
+        self.assertEqual(config.max_lookahead, 1)
+
+        frames = [
+            {"state": np.array([0.0, 0.0])},
+            {"state": np.array([1.0, 1.0])},
+            {"state": np.array([2.0, 2.0])},
+        ]
+        resolved = [
+            config.resolve(frame, future=tuple(frames[index + 1 :]))["action"]
+            for index, frame in enumerate(frames)
+        ]
+        np.testing.assert_allclose(resolved[0], [1.0, 1.0])
+        np.testing.assert_allclose(resolved[1], [2.0, 2.0])
+        # Last frame has no future: clamp to its own state.
+        np.testing.assert_allclose(resolved[2], [2.0, 2.0])
+
+    def test_combine_concat_joins_sources_in_order(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [4],
+                        "sources": ["left", "right"],
+                        "combine": "concat",
+                        "transforms": [{"op": "astype", "dtype": "float32"}],
+                    },
+                },
+            }
+        )
+        frame = config.resolve({"left": [1.0, 2.0], "right": [3.0, 4.0]})
+        np.testing.assert_allclose(frame["action"], [1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(frame["action"].dtype, np.float32)
+
+    def test_combine_concat_with_lookahead(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [4],
+                        "sources": ["left", "right"],
+                        "combine": "concat",
+                        "lookahead": 1,
+                    },
+                },
+            }
+        )
+        current = {"left": [0.0, 0.0], "right": [0.0, 0.0]}
+        nxt = {"left": [1.0, 1.0], "right": [2.0, 2.0]}
+        np.testing.assert_allclose(
+            config.resolve(current, future=(nxt,))["action"], [1.0, 1.0, 2.0, 2.0]
+        )
+        np.testing.assert_allclose(config.resolve(nxt, future=())["action"], [1.0, 1.0, 2.0, 2.0])
+
+    def test_concat_requires_every_source(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [4],
+                        "sources": ["left", "right"],
+                        "combine": "concat",
+                    },
+                },
+            }
+        )
+        with self.assertRaises(MappingError):
+            config.resolve({"left": [1.0, 2.0]})
+        self.assertEqual(config.missing_fields({"left": [1.0, 2.0]}), ["action"])
+
+    def test_state_to_action_matches_lookahead(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [2],
+                        "source": "state",
+                        "transforms": [{"op": "state_to_action"}],
+                    },
+                },
+            }
+        )
+        self.assertEqual(config.max_lookahead, 1)
+
+        current = {"state": np.array([0.0, 0.0])}
+        nxt = {"state": np.array([1.0, 1.0])}
+        np.testing.assert_allclose(
+            config.resolve(current, future=(nxt,))["action"], [1.0, 1.0]
+        )
+        # Last frame clamps to its own state.
+        np.testing.assert_allclose(config.resolve(nxt, future=())["action"], [1.0, 1.0])
+
+    def test_state_to_action_with_concat(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [4],
+                        "sources": ["left", "right"],
+                        "combine": "concat",
+                        "transforms": [{"op": "state_to_action"}],
+                    },
+                },
+            }
+        )
+        current = {"left": [0.0, 0.0], "right": [0.0, 0.0]}
+        nxt = {"left": [1.0, 1.0], "right": [2.0, 2.0]}
+        np.testing.assert_allclose(
+            config.resolve(current, future=(nxt,))["action"], [1.0, 1.0, 2.0, 2.0]
+        )
+
+    def test_state_to_action_is_not_a_per_value_transform(self) -> None:
+        from ego2lerobot.mapping import apply_transform
+
+        with self.assertRaises(MappingError):
+            apply_transform("state_to_action", np.array([1.0]))
+
+    def test_invalid_combine_and_lookahead_rejected(self) -> None:
+        for feature in (
+            {"dtype": "float32", "source": "a", "combine": "sum"},
+            {"dtype": "float32", "source": "a", "lookahead": -1},
+            {"dtype": "float32", "source": "a", "lookahead": "1"},
+            {"dtype": "float32", "sources": ["a"], "combine": "concat", "default": [0.0]},
+            {
+                "dtype": "float32",
+                "source": "a",
+                "transforms": [{"op": "state_to_action", "lookahead": 0}],
+            },
+        ):
+            with self.assertRaises(MappingError):
+                MappingConfig.from_dict({"fps": 10, "features": {"x": feature}})
+
 
 class ReaderAndWorkerTest(unittest.TestCase):
     @classmethod

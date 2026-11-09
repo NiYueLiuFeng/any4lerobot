@@ -34,6 +34,27 @@ A source may be a single dotted path or a list of candidates; the first one
 found wins.  A feature without ``source`` and without ``default`` is rejected
 at load time.  ``required: false`` turns a missing value into ``None`` instead
 of an error.
+
+Two composition options extend that rule:
+
+``combine: concat``
+    Concatenate every entry of ``sources`` in order instead of picking the
+    first one found.  Useful for ``action`` built from several streams.
+
+``lookahead: N``
+    Resolve the source(s) from the frame ``N`` steps ahead instead of the
+    current one (``action[t] = state[t+1]``).  At the end of the episode the
+    window is clamped to the last frame, so the last action reuses the last
+    state.
+
+The same shift can be written as a named transform, which reads better in a
+config::
+
+    transforms:
+      - op: state_to_action    # action[t] = state[t+1], clamped at the end
+
+``state_to_action`` is a temporal directive: the mapping layer applies it when
+picking the source frame, so it cannot be called on a single value.
 """
 
 from __future__ import annotations
@@ -62,6 +83,10 @@ _NUMPY_DTYPES = {
 }
 _SPECIAL_DTYPES = {"image", "video", "string"}
 
+#: Transforms that select *which frame* to read instead of editing a value.
+#: They are resolved by :meth:`FeatureSpec.resolve`, not by ``_TRANSFORMS``.
+_TEMPORAL_OPS = {"state_to_action"}
+
 
 class MappingError(ValueError):
     """Raised for an invalid mapping file or an unresolvable field."""
@@ -86,27 +111,44 @@ class FeatureSpec:
     required: bool = True
     transforms: tuple[TransformSpec, ...] = ()
     names: Any = None
+    #: ``"first"`` (first source found wins) or ``"concat"`` (join all sources).
+    combine: str = "first"
+    #: Resolve sources from this many frames ahead; clamped at the episode end.
+    lookahead: int = 0
 
-    def resolve(self, record: Mapping[str, Any]) -> Any:
-        value = _MISSING
-        used_source: str | None = None
-        for source in self.sources:
-            value = _lookup(record, source)
-            if value is not _MISSING:
-                used_source = source
-                break
+    def resolve(
+        self,
+        record: Mapping[str, Any],
+        *,
+        future: Sequence[Mapping[str, Any]] = (),
+    ) -> Any:
+        source_record = self._source_record(record, future)
 
-        if value is _MISSING:
-            if self.default is not _MISSING:
-                value = self.default
-            elif self.required:
-                tried = ", ".join(self.sources) or "(no source)"
-                raise MappingError(f"feature {self.name!r}: value not found; tried {tried}")
-            else:
-                return None
+        if self.combine == "concat":
+            value = self._concat(source_record)
+            used_source: str | None = ", ".join(self.sources)
+        else:
+            value = _MISSING
+            used_source = None
+            for source in self.sources:
+                value = _lookup(source_record, source)
+                if value is not _MISSING:
+                    used_source = source
+                    break
+
+            if value is _MISSING:
+                if self.default is not _MISSING:
+                    value = self.default
+                elif self.required:
+                    tried = ", ".join(self.sources) or "(no source)"
+                    raise MappingError(f"feature {self.name!r}: value not found; tried {tried}")
+                else:
+                    return None
 
         try:
             for transform in self.transforms:
+                if transform.op in _TEMPORAL_OPS:
+                    continue  # applied when selecting the source frame
                 value = transform.apply(value)
         except Exception as exc:
             origin = f" from {used_source!r}" if used_source else ""
@@ -115,6 +157,42 @@ class FeatureSpec:
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         return value
+
+    @property
+    def lookahead_frames(self) -> int:
+        """Effective lookahead, including ``state_to_action`` directives."""
+
+        frames = self.lookahead
+        for transform in self.transforms:
+            if transform.op in _TEMPORAL_OPS:
+                frames = max(frames, int(transform.params.get("lookahead", 1)))
+        return frames
+
+    def _source_record(
+        self, record: Mapping[str, Any], future: Sequence[Mapping[str, Any]]
+    ) -> Mapping[str, Any]:
+        """Pick the frame a lookahead feature reads its sources from."""
+
+        lookahead = self.lookahead_frames
+        if lookahead <= 0:
+            return record
+        # Clamp at the end of the episode: late frames reuse the last frame.
+        index = min(lookahead, len(future)) - 1
+        return future[index] if index >= 0 else record
+
+    def _concat(self, record: Mapping[str, Any]) -> Any:
+        """Join every source into one array (axis 0), in declaration order."""
+
+        np = _np()
+        values = []
+        for source in self.sources:
+            item = _lookup(record, source)
+            if item is _MISSING:
+                raise MappingError(
+                    f"feature {self.name!r}: source {source!r} is required for concat"
+                )
+            values.append(np.atleast_1d(item))
+        return np.concatenate(values, axis=0)
 
     def to_lerobot(self) -> dict[str, Any]:
         # LeRobot validates ``value.shape != feature["shape"]``; numpy shapes are
@@ -186,12 +264,31 @@ class MappingConfig:
 
     # ------------------------------------------------------------------- use
 
-    def resolve(self, record: Mapping[str, Any]) -> dict[str, Any]:
-        """Map one raw record to a LeRobot ``add_frame`` dictionary."""
+    def resolve(
+        self,
+        record: Mapping[str, Any],
+        *,
+        future: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        """Map one raw record to a LeRobot ``add_frame`` dictionary.
 
-        frame = {name: spec.resolve(record) for name, spec in self.features.items()}
-        frame["task"] = self.task.resolve(record)
+        ``future`` holds the records that follow ``record``; features with a
+        ``lookahead`` read from it.  Streaming callers should pass at least
+        :attr:`max_lookahead` records, and the empty tail is clamped.
+        """
+
+        frame = {
+            name: spec.resolve(record, future=future)
+            for name, spec in self.features.items()
+        }
+        frame["task"] = self.task.resolve(record, future=future)
         return frame
+
+    @property
+    def max_lookahead(self) -> int:
+        """Largest lookahead any feature asks for, in frames."""
+
+        return max((spec.lookahead_frames for spec in self.features.values()), default=0)
 
     def lerobot_features(self) -> dict[str, dict[str, Any]]:
         """Features argument for ``LeRobotDataset.create``."""
@@ -203,6 +300,12 @@ class MappingConfig:
 
         missing: list[str] = []
         for name, spec in self.features.items():
+            if spec.combine == "concat":
+                # Every source is used, so a single missing one is fatal.
+                if all(_lookup(record, source) is not _MISSING for source in spec.sources):
+                    continue
+                missing.append(name)
+                continue
             if any(_lookup(record, source) is not _MISSING for source in spec.sources):
                 continue
             if spec.default is not _MISSING or not spec.required:
@@ -215,7 +318,18 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
     if not isinstance(raw, dict):
         raise MappingError(f"feature {name!r}: expected a mapping, got {type(raw).__name__}")
 
-    allowed = {"dtype", "shape", "source", "sources", "default", "required", "transforms", "names"}
+    allowed = {
+        "dtype",
+        "shape",
+        "source",
+        "sources",
+        "default",
+        "required",
+        "transforms",
+        "names",
+        "combine",
+        "lookahead",
+    }
     unknown = set(raw) - allowed
     if unknown:
         raise MappingError(f"feature {name!r}: unknown keys {sorted(unknown)}")
@@ -250,7 +364,29 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
     if not sources and "default" not in raw and raw.get("required", True):
         raise MappingError(f"feature {name!r}: needs a source or a default value")
 
+    combine = str(raw.get("combine", "first")).lower()
+    if combine not in {"first", "concat"}:
+        raise MappingError(
+            f"feature {name!r}: combine must be 'first' or 'concat', got {combine!r}"
+        )
+    if combine == "concat" and not sources:
+        raise MappingError(f"feature {name!r}: combine 'concat' needs at least one source")
+    if combine == "concat" and "default" in raw:
+        raise MappingError(f"feature {name!r}: combine 'concat' cannot use a default value")
+
+    lookahead = raw.get("lookahead", 0)
+    if not isinstance(lookahead, int) or isinstance(lookahead, bool) or lookahead < 0:
+        raise MappingError(f"feature {name!r}: lookahead must be a non-negative integer")
+
     transforms = tuple(_parse_transform(name, item) for item in raw.get("transforms", []) or [])
+    for transform in transforms:
+        if transform.op not in _TEMPORAL_OPS:
+            continue
+        offset = transform.params.get("lookahead", 1)
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
+            raise MappingError(
+                f"feature {name!r}: {transform.op} lookahead must be a positive integer"
+            )
 
     return FeatureSpec(
         name=name,
@@ -261,6 +397,8 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
         required=bool(raw.get("required", True)),
         transforms=transforms,
         names=raw.get("names"),
+        combine=combine,
+        lookahead=lookahead,
     )
 
 
@@ -296,9 +434,10 @@ def _parse_transform(feature: str, raw: Any) -> TransformSpec:
         op, params = raw, {}
     else:
         raise MappingError(f"feature {feature!r}: transform must be a string or a mapping")
-    if op not in _TRANSFORMS:
+    if op not in _TRANSFORMS and op not in _TEMPORAL_OPS:
+        available = sorted(set(_TRANSFORMS) | _TEMPORAL_OPS)
         raise MappingError(
-            f"feature {feature!r}: unknown transform {op!r}; available: {sorted(_TRANSFORMS)}"
+            f"feature {feature!r}: unknown transform {op!r}; available: {available}"
         )
     return TransformSpec(op=op, params=params)
 
@@ -435,6 +574,11 @@ def _as_image(value: Any, dtype: str = "uint8", channel_order: str = "HWC", **_:
 def apply_transform(op: str, value: Any, params: Mapping[str, Any] | None = None) -> Any:
     """Apply one named transform.  Exposed for tests and custom pipelines."""
 
+    if op in _TEMPORAL_OPS:
+        raise MappingError(
+            f"transform {op!r} is a temporal directive; list it in a feature's "
+            "'transforms' so the mapping layer can pick the source frame"
+        )
     try:
         fn = _TRANSFORMS[op]
     except KeyError as exc:
