@@ -120,11 +120,11 @@ writer:
 |---|---|---|
 | `dtype` | ✅ | NumPy dtype（`float32`、`int64`、`uint8`…）或特殊值 `image` / `video` / `string` |
 | `shape` | 建议 | 单帧形状（**不含时间维**），如 `[7]`、`[480, 640, 3]`；LeRobot 会逐帧校验 |
-| `source` | 二选一 | 在 reader 产出的 record 里查找的路径，字符串或候选列表 |
+| `source` | 二选一 | 在 reader 产出的 record 里查找的路径：字符串、候选列表，或 `{source, transforms}` 条目列表 |
 | `sources` | 二选一 | `source` 的别名，等价写法 |
 | `default` | 可选 | 所有 `source` 都找不到时使用的常量 |
 | `required` | 可选 | 默认 `true`；设为 `false` 时缺失会得到 `None` 而不是报错 |
-| `transforms` | 可选 | 按顺序应用的变换列表 |
+| `transforms` | 可选 | 按顺序应用的变换列表；作用于 `combine` 之后的结果（per-source 变换写在 `sources` 条目里） |
 | `names` | 可选 | 维度名元信息，原样写入 LeRobot feature（不做校验） |
 | `key_name` | 可选 | 每个维度的含义，如 `[left_x, left_y, left_z]`；按 `shape` 校验并展开后写入 LeRobot 的 `names` |
 | `combine` | 可选 | `first`（默认，候选里第一个存在的胜出）或 `concat`（按声明顺序拼接所有 `sources`） |
@@ -138,9 +138,46 @@ writer:
 - `key_name` 必须与 `shape` 匹配：数值特征每个元素一个名字（`[21, 3]` 需要 63 个），
   图像/视频特征每个轴一个名字（如 `[height, width, channels]`）；嵌套列表按行优先展开；
 - `key_name` 与 `names` 不要同时写（前者会校验并展平，后者原样透传）；
+- `sources` 的每一项必须是字符串或 `{source, transforms}`；映射条目只允许这两个键；
+- per-source `transforms` 不能使用 `state_to_action`，时序指令只能写在 feature 级 `transforms`；
 - `combine: concat` 必须至少有一个 `source`，且不能同时使用 `default`；
 - `lookahead` 必须是非负整数（`true`/`"1"` 都不接受）；
 - feature 名不能为空。
+
+#### concat 时对每个 source 单独变换
+
+`combine: concat` 时，`sources` 的每一项可以带自己的 `transforms`，在拼接前执行：
+
+```yaml
+action:
+  dtype: float32
+  shape: [14]
+  combine: concat
+  sources:
+    - source: obs.ee_pose_left
+      transforms:
+        - {op: astype, dtype: float32}
+    - source: obs.ee_pose_right
+      transforms:
+        - {op: reshape, shape: [7]}
+        - {op: astype, dtype: float32}
+  # 仍然作用于 concat 之后的结果
+  transforms:
+    - op: state_to_action
+    - {op: astype, dtype: float32}
+```
+
+执行顺序：
+
+```text
+每个 source 查值 → per-source transforms → atleast_1d → concat(axis=0) → feature.transforms
+```
+
+- 每个 source 可以写不同的变换；
+- 同一个 source 可以在 `sources` 里出现多次，并分别做不同的 `slice`/`reshape`；
+- 纯字符串写法 `sources: [a, b]` 完全兼容；
+- `combine: first` 时只执行最终选中那个 source 的 transforms；
+- 拼接固定按 `axis=0`，per-source 的 `reshape` 要产生能拼接的形状（两个 `[21, 3]` → `[42, 3]`，两个 `[7]` → `[14]`）。
 
 ### 1.3 `source` 的解析规则
 
@@ -259,6 +296,22 @@ action:
 ```
 
 两种写法可以叠加：`combine: concat` + `state_to_action` 表示拼接**下一帧**的多个字段；拼接后的数组仍可继续走其它 `transforms`（`reshape`、`astype` 等）。
+
+需要先分别处理每个字段再拼接时，把 `sources` 写成 `{source, transforms}` 条目（语法见 1.2 末尾）：
+
+```yaml
+observation.state.hand_world:
+  dtype: float32
+  shape: [42, 3]
+  combine: concat
+  sources:
+    - source: obs.obs_keypoints_left
+      transforms: [{op: reshape, shape: [21, 3]}]
+    - source: obs.obs_keypoints_right
+      transforms: [{op: reshape, shape: [21, 3]}]
+  transforms:
+    - {op: astype, dtype: float32}
+```
 
 ---
 

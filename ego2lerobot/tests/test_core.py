@@ -356,6 +356,156 @@ class MappingTest(unittest.TestCase):
             config.resolve({"left": [1.0, 2.0]})
         self.assertEqual(config.missing_fields({"left": [1.0, 2.0]}), ["action"])
 
+    def test_concat_applies_per_source_transforms_before_joining(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [4],
+                        "combine": "concat",
+                        "sources": [
+                            {"source": "left"},
+                            {
+                                "source": "right",
+                                "transforms": [{"op": "reshape", "shape": [2]}],
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+        frame = config.resolve({"left": [1.0, 2.0], "right": [[3.0], [4.0]]})
+        np.testing.assert_allclose(frame["action"], [1.0, 2.0, 3.0, 4.0])
+
+    def test_concat_per_source_transforms_run_before_feature_transforms(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [4],
+                        "combine": "concat",
+                        "sources": [
+                            {
+                                "source": "left",
+                                "transforms": [{"op": "scale", "factor": 10.0}],
+                            },
+                            {"source": "right"},
+                        ],
+                        "transforms": [{"op": "scale", "factor": 2.0}],
+                    },
+                },
+            }
+        )
+        frame = config.resolve({"left": [1.0, 2.0], "right": [3.0, 4.0]})
+        np.testing.assert_allclose(frame["action"], [20.0, 40.0, 6.0, 8.0])
+
+    def test_same_source_twice_with_different_slices(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "pose": {
+                        "dtype": "float32",
+                        "shape": [4],
+                        "combine": "concat",
+                        "sources": [
+                            {
+                                "source": "state",
+                                "transforms": [{"op": "slice", "stop": 2}],
+                            },
+                            {
+                                "source": "state",
+                                "transforms": [
+                                    {"op": "slice", "start": 2, "stop": 4}
+                                ],
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+        frame = config.resolve({"state": [1.0, 2.0, 3.0, 4.0]})
+        np.testing.assert_allclose(frame["pose"], [1.0, 2.0, 3.0, 4.0])
+
+    def test_first_combine_applies_only_the_selected_source_transforms(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "x": {
+                        "dtype": "float32",
+                        "shape": [2],
+                        "sources": [
+                            {
+                                "source": "missing",
+                                "transforms": [{"op": "scale", "factor": 100.0}],
+                            },
+                            {
+                                "source": "value",
+                                "transforms": [{"op": "scale", "factor": 2.0}],
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+        frame = config.resolve({"value": [1.0, 2.0]})
+        np.testing.assert_allclose(frame["x"], [2.0, 4.0])
+
+    def test_per_source_transform_failure_mentions_the_source(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "x": {
+                        "dtype": "float32",
+                        "shape": [2],
+                        "combine": "concat",
+                        "sources": [
+                            {
+                                "source": "left",
+                                "transforms": [{"op": "reshape", "shape": [3]}],
+                            },
+                            {"source": "right"},
+                        ],
+                    },
+                },
+            }
+        )
+        with self.assertRaisesRegex(MappingError, "source 'left'"):
+            config.resolve({"left": [1.0, 2.0], "right": [3.0, 4.0]})
+
+    def test_invalid_source_entries_rejected(self) -> None:
+        for entry in (
+            "",  # empty name
+            3,  # not a string/mapping
+            {"transforms": []},  # missing source
+            {"source": "", "transforms": []},  # empty source
+            {"source": "a", "bogus": 1},  # unknown key
+            {  # temporal directives belong to the feature level
+                "source": "a",
+                "transforms": [{"op": "state_to_action"}],
+            },
+        ):
+            with self.assertRaises(MappingError):
+                MappingConfig.from_dict(
+                    {
+                        "fps": 10,
+                        "features": {
+                            "x": {
+                                "dtype": "float32",
+                                "shape": [2],
+                                "combine": "concat",
+                                "sources": ["a", entry],
+                            }
+                        },
+                    }
+                )
+
     def test_state_to_action_matches_lookahead(self) -> None:
         config = MappingConfig.from_dict(
             {

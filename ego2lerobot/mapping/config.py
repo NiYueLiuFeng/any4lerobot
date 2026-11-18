@@ -42,6 +42,19 @@ matching ``shape`` are flattened row-major); image/video features take one name
 per axis (e.g. ``[height, width, channels]``).  The length is validated against
 ``shape`` at load time.
 
+Each entry of ``sources`` may carry its own transforms, applied to that source
+before ``combine`` joins the values::
+
+    sources:
+      - source: left.keypoints
+        transforms: [{op: reshape, shape: [21, 3]}]
+      - source: right.keypoints
+        transforms: [{op: reshape, shape: [21, 3]}]
+
+Feature-level ``transforms`` still run on the combined value.  Temporal
+directives such as ``state_to_action`` are only allowed there, because they
+select the source frame rather than editing one value.
+
 Two composition options extend that rule:
 
 ``combine: concat``
@@ -109,11 +122,35 @@ class TransformSpec:
 
 
 @dataclass(frozen=True)
+class SourceSpec:
+    """One candidate source and the transforms applied before ``combine``."""
+
+    name: str
+    transforms: tuple[TransformSpec, ...] = ()
+
+    def resolve(self, record: Mapping[str, Any], *, feature: str) -> Any:
+        """Look the source up, then apply its own transforms in order."""
+
+        value = _lookup(record, self.name)
+        if value is _MISSING:
+            return _MISSING
+        for transform in self.transforms:
+            try:
+                value = transform.apply(value)
+            except Exception as exc:
+                raise MappingError(
+                    f"feature {feature!r}: source {self.name!r} transform "
+                    f"{transform.op!r} failed: {type(exc).__name__}: {exc}"
+                ) from exc
+        return value
+
+
+@dataclass(frozen=True)
 class FeatureSpec:
     name: str
     dtype: str
     shape: tuple[int, ...] | None
-    sources: tuple[str, ...]
+    sources: tuple[SourceSpec, ...]
     default: Any = _MISSING
     required: bool = True
     transforms: tuple[TransformSpec, ...] = ()
@@ -137,22 +174,22 @@ class FeatureSpec:
 
         if self.combine == "concat":
             value = self._concat(source_record)
-            used_source: str | None = ", ".join(self.sources)
+            used_source: str | None = ", ".join(s.name for s in self.sources)
         else:
             value = _MISSING
             used_source = None
             for source in self.sources:
-                value = _lookup(source_record, source)
+                value = source.resolve(source_record, feature=self.name)
                 if value is not _MISSING:
-                    used_source = source
+                    used_source = source.name
                     break
 
             if value is _MISSING:
                 if self.default is not _MISSING:
                     value = self.default
                 elif self.required:
-                    tried = ", ".join(self.sources) or "(no source)"
-                    raise MappingError(f"feature {self.name!r}: value not found; tried {tried}")
+                    names = ", ".join(s.name for s in self.sources) or "(no source)"
+                    raise MappingError(f"feature {self.name!r}: value not found; tried {names}")
                 else:
                     return None
 
@@ -197,10 +234,10 @@ class FeatureSpec:
         np = _np()
         values = []
         for source in self.sources:
-            item = _lookup(record, source)
+            item = source.resolve(record, feature=self.name)
             if item is _MISSING:
                 raise MappingError(
-                    f"feature {self.name!r}: source {source!r} is required for concat"
+                    f"feature {self.name!r}: source {source.name!r} is required for concat"
                 )
             values.append(np.atleast_1d(item))
         return np.concatenate(values, axis=0)
@@ -315,11 +352,17 @@ class MappingConfig:
         for name, spec in self.features.items():
             if spec.combine == "concat":
                 # Every source is used, so a single missing one is fatal.
-                if all(_lookup(record, source) is not _MISSING for source in spec.sources):
+                if all(
+                    _lookup(record, source.name) is not _MISSING
+                    for source in spec.sources
+                ):
                     continue
                 missing.append(name)
                 continue
-            if any(_lookup(record, source) is not _MISSING for source in spec.sources):
+            if any(
+                _lookup(record, source.name) is not _MISSING
+                for source in spec.sources
+            ):
                 continue
             if spec.default is not _MISSING or not spec.required:
                 continue
@@ -363,17 +406,18 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
             raise MappingError(f"feature {name!r}: shape must be a list of positive integers")
         shape = tuple(shape)
 
-    sources = raw.get("sources", raw.get("source"))
-    if sources is None:
-        sources = ()
-    elif isinstance(sources, str):
-        sources = (sources,)
-    elif isinstance(sources, (list, tuple)):
-        if not all(isinstance(item, str) and item for item in sources):
-            raise MappingError(f"feature {name!r}: source entries must be non-empty strings")
-        sources = tuple(sources)
-    else:
-        raise MappingError(f"feature {name!r}: source must be a string or a list of strings")
+    raw_sources = raw.get("sources", raw.get("source"))
+    if raw_sources is None:
+        raw_sources = ()
+    elif isinstance(raw_sources, str):
+        raw_sources = (raw_sources,)
+    elif not isinstance(raw_sources, (list, tuple)):
+        raise MappingError(
+            f"feature {name!r}: source must be a string or a list of sources"
+        )
+    sources = tuple(
+        _parse_source(name, index, item) for index, item in enumerate(raw_sources)
+    )
 
     if not sources and "default" not in raw and raw.get("required", True):
         raise MappingError(f"feature {name!r}: needs a source or a default value")
@@ -422,6 +466,46 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
         combine=combine,
         lookahead=lookahead,
     )
+
+
+_SOURCE_KEYS = {"source", "transforms"}
+
+
+def _parse_source(feature: str, index: int, raw: Any) -> SourceSpec:
+    """Parse one ``sources`` entry: a name or ``{source, transforms}``."""
+    if isinstance(raw, str):
+        if not raw:
+            raise MappingError(
+                f"feature {feature!r}: sources[{index}] must be a non-empty string"
+            )
+        return SourceSpec(name=raw)
+    if not isinstance(raw, Mapping):
+        raise MappingError(
+            f"feature {feature!r}: sources[{index}] must be a string or a mapping "
+            "with 'source' and optional 'transforms'"
+        )
+
+    unknown = set(raw) - _SOURCE_KEYS
+    if unknown:
+        raise MappingError(
+            f"feature {feature!r}: sources[{index}] has unknown keys {sorted(unknown)}"
+        )
+    source_name = raw.get("source")
+    if not isinstance(source_name, str) or not source_name:
+        raise MappingError(
+            f"feature {feature!r}: sources[{index}] needs a non-empty 'source'"
+        )
+
+    transforms = tuple(
+        _parse_transform(feature, item) for item in raw.get("transforms", []) or []
+    )
+    for transform in transforms:
+        if transform.op in _TEMPORAL_OPS:
+            raise MappingError(
+                f"feature {feature!r}: sources[{index}] cannot use temporal "
+                f"transform {transform.op!r}; put it in the feature-level transforms"
+            )
+    return SourceSpec(name=source_name, transforms=transforms)
 
 
 def _parse_key_name(
@@ -681,6 +765,7 @@ __all__ = [
     "FeatureSpec",
     "MappingConfig",
     "MappingError",
+    "SourceSpec",
     "TransformSpec",
     "apply_transform",
 ]
