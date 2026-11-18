@@ -24,9 +24,11 @@ from ego2lerobot.config import PipelineConfig
 from ego2lerobot.readers import EgoEgoverseReader, make_reader
 
 
-def _jpeg_bytes() -> bytes:
+def _jpeg_bytes(value: int = 128) -> bytes:
     buffer = io.BytesIO()
-    Image.fromarray(np.full((4, 4, 3), 128, dtype=np.uint8)).save(buffer, format="JPEG")
+    Image.fromarray(np.full((4, 4, 3), value, dtype=np.uint8)).save(
+        buffer, format="JPEG"
+    )
     return buffer.getvalue()
 
 
@@ -159,6 +161,144 @@ class EgoEgoverseReaderTest(unittest.TestCase):
 
         self.assertEqual(len(plan.tasks), 1)
         self.assertEqual(plan.tasks[0].input_path, self.episode / "zarr.json")
+
+    # ------------------------------------------------------- frame declaration
+
+    def _write_padded_episode(
+        self,
+        path: Path,
+        *,
+        frames: int,
+        declared: int,
+        tail_has_data: bool = False,
+        with_images: bool = False,
+        image_tail_varies: bool = False,
+    ) -> None:
+        """Write an episode whose arrays are longer than ``attrs.total_frames``."""
+        group = zarr.open_group(path, mode="w")
+        group.attrs.update({"total_frames": declared})
+        poses = np.ones((frames, 7), dtype=np.float64)
+        if not tail_has_data:
+            poses[declared:] = 0.0
+        group.create_array("right.obs_ee_pose", data=poses)
+        stamps = np.arange(frames, dtype=np.int64) + 1
+        if not tail_has_data:
+            stamps[declared:] = 0
+        group.create_array("obs_rgb_timestamps_ns", data=stamps)
+        if with_images:
+            payloads = [_jpeg_bytes(20 + 10 * i) for i in range(declared)]
+            if image_tail_varies:
+                payloads += [_jpeg_bytes(200 + 10 * i) for i in range(declared, frames)]
+            else:
+                # Padding repeats the last real frame, as EgoVerse preallocation does.
+                payloads += [payloads[-1]] * (frames - declared)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                images = group.create_array(
+                    "images.front_1", shape=(frames,), dtype=VariableLengthBytes()
+                )
+                images[:] = np.array(payloads, dtype=object)
+
+    def test_declared_total_frames_trims_zero_padding(self) -> None:
+        episode = self.root / "padded"
+        self._write_padded_episode(episode, frames=5, declared=3)
+        reader = make_reader(
+            {
+                "type": "ego_egoverse",
+                "arrays": {
+                    "pose": "right.obs_ee_pose",
+                    "ts": "obs_rgb_timestamps_ns",
+                },
+            }
+        )
+
+        with self.assertWarns(UserWarning):
+            reader.validate(episode)
+        records = list(reader.iter_frames(episode))
+
+        self.assertEqual([record["frame_index"] for record in records], [0, 1, 2])
+        np.testing.assert_array_equal(records[-1]["pose"], np.ones(7))
+
+    def test_declared_total_frames_trims_repeated_image_tail(self) -> None:
+        episode = self.root / "padded_images"
+        self._write_padded_episode(
+            episode, frames=5, declared=3, with_images=True
+        )
+        reader = make_reader(
+            {
+                "type": "ego_egoverse",
+                "arrays": {"pose": "right.obs_ee_pose"},
+                "images": {"cam": "images.front_1"},
+            }
+        )
+
+        with self.assertWarns(UserWarning):
+            records = list(reader.iter_frames(episode))
+
+        self.assertEqual(len(records), 3)
+        self.assertEqual(records[-1]["cam"].shape, (4, 4, 3))
+
+    def test_declared_total_frames_shorter_than_image_data_is_ignored(self) -> None:
+        episode = self.root / "not_padded_images"
+        self._write_padded_episode(
+            episode,
+            frames=5,
+            declared=3,
+            with_images=True,
+            image_tail_varies=True,
+        )
+        reader = make_reader(
+            {
+                "type": "ego_egoverse",
+                "arrays": {"pose": "right.obs_ee_pose"},
+                "images": {"cam": "images.front_1"},
+            }
+        )
+
+        with self.assertWarns(UserWarning):
+            records = list(reader.iter_frames(episode))
+        self.assertEqual(len(records), 5)
+
+    def test_declared_total_frames_shorter_than_real_data_is_ignored(self) -> None:
+        episode = self.root / "not_padded"
+        self._write_padded_episode(
+            episode, frames=5, declared=3, tail_has_data=True
+        )
+        reader = make_reader(
+            {
+                "type": "ego_egoverse",
+                "arrays": {
+                    "pose": "right.obs_ee_pose",
+                    "ts": "obs_rgb_timestamps_ns",
+                },
+            }
+        )
+
+        with self.assertWarns(UserWarning):
+            records = list(reader.iter_frames(episode))
+        self.assertEqual(len(records), 5)
+
+    def test_declared_total_frames_larger_than_arrays_is_ignored(self) -> None:
+        episode = self.root / "over_declared"
+        self._write_padded_episode(episode, frames=5, declared=9)
+        reader = make_reader(
+            {"type": "ego_egoverse", "arrays": {"pose": "right.obs_ee_pose"}}
+        )
+
+        with self.assertWarns(UserWarning):
+            records = list(reader.iter_frames(episode))
+        self.assertEqual(len(records), 5)
+
+    def test_matching_total_frames_is_silent(self) -> None:
+        episode = self.root / "matching"
+        self._write_padded_episode(episode, frames=5, declared=5)
+        reader = make_reader(
+            {"type": "ego_egoverse", "arrays": {"pose": "right.obs_ee_pose"}}
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertEqual(len(list(reader.iter_frames(episode))), 5)
 
     # ---------------------------------------------------------------- errors
 

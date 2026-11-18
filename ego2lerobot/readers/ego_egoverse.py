@@ -39,14 +39,19 @@ mapping when LeRobot expects something else.  Images are decoded one frame at
 a time, so a long episode is never held in memory.  Group attributes are
 attached to every record as ``record["attrs"]``.
 
-``attrs.total_frames`` is advisory: the frame count comes from the selected
-arrays, because real EgoVerse samples can disagree with it.
+The frame count comes from the selected arrays, but a smaller
+``attrs.total_frames`` wins when the extra rows are padding.  EgoVerse writers
+preallocate the arrays beyond the episode and fill the tail with zero poses,
+zero timestamps and a repeat of the last image; those frames are cut so
+downstream validation never sees them.  Any other disagreement keeps the array
+length and only emits a warning.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import warnings
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -213,7 +218,8 @@ class EgoEgoverseReader(EpisodeReader):
         base = _episode_dir(path)
         group = _open_group(base)
         streams = self._resolve(group)
-        return group, streams, _frame_count(streams, base)
+        total = _frame_count(streams, base, group.attrs.get("total_frames"))
+        return group, streams, total
 
     def _resolve(self, group: Any) -> dict[str, tuple[Any, str]]:
         """Return ``{source: (array_node, kind)}`` for this episode.
@@ -323,8 +329,21 @@ def _member_node(group: Any, member: str, source: str) -> Any:
     return node
 
 
-def _frame_count(streams: Mapping[str, tuple[Any, str]], base: Path) -> int:
-    """Return the episode length, requiring all time-indexed streams to agree."""
+def _frame_count(
+    streams: Mapping[str, tuple[Any, str]],
+    base: Path,
+    declared: Any = None,
+) -> int:
+    """Return the episode length, requiring all time-indexed streams to agree.
+
+    EgoVerse writers can preallocate the arrays beyond the episode and leave
+    the tail zero-filled, so the raw array length may include fake frames
+    (zero poses, empty images) that break downstream validation.  A smaller
+    ``attrs.total_frames`` is therefore used as the length *only* when the
+    rows after it are verifiably padding.  Otherwise (no declaration, a larger
+    one, or real data in the tail) the array length wins and a warning records
+    the disagreement.
+    """
     lengths = {}
     for source, (node, _) in streams.items():
         shape = getattr(node, "shape", None) or ()
@@ -341,7 +360,134 @@ def _frame_count(streams: Mapping[str, tuple[Any, str]], base: Path) -> int:
     total = next(iter(distinct))
     if total <= 0:
         raise ValueError(f"empty episode: {base}")
-    return total
+    return _trim_padding(streams, base, total, declared)
+
+
+def _trim_padding(
+    streams: Mapping[str, tuple[Any, str]],
+    base: Path,
+    total: int,
+    declared: Any,
+) -> int:
+    """Drop trailing zero-filled padding frames declared by ``total_frames``."""
+    try:
+        declared_total = int(declared)
+    except (TypeError, ValueError):
+        return total
+    if declared_total <= 0 or declared_total == total:
+        return total
+
+    if declared_total > total:
+        warnings.warn(
+            f"{base}: attrs.total_frames={declared_total} exceeds the arrays "
+            f"({total} frames); using the array length",
+            stacklevel=3,
+        )
+        return total
+
+    if not _tail_is_padding(streams, declared_total, total):
+        warnings.warn(
+            f"{base}: attrs.total_frames={declared_total} is shorter than the "
+            f"arrays ({total} frames) but the extra rows hold data; using the "
+            "array length",
+            stacklevel=3,
+        )
+        return total
+
+    warnings.warn(
+        f"{base}: trimmed {total - declared_total} zero-filled padding "
+        f"frame(s) after attrs.total_frames={declared_total}",
+        stacklevel=3,
+    )
+    return declared_total
+
+
+#: Rows checked per slice while testing whether a tail is padding.
+_PADDING_CHUNK = 1024
+
+
+def _tail_is_padding(
+    streams: Mapping[str, tuple[Any, str]], start: int, stop: int
+) -> bool:
+    """Return True when every stream row in ``[start, stop)`` is padding.
+
+    Numeric rows must be zero/NaN.  Image rows must be empty or an exact
+    repeat of the last real frame (EgoVerse preallocation copies that frame).
+    """
+    for node, kind in streams.values():
+        if getattr(node, "ndim", None) == 0:
+            continue  # scalar member: constant per frame, not time-indexed
+        check = _image_tail_is_padding if kind == _IMAGE else _numeric_tail_is_zero
+        if not check(node, start, stop):
+            return False
+    return True
+
+
+def _numeric_tail_is_zero(node: Any, start: int, stop: int) -> bool:
+    """Return True when the rows ``[start, stop)`` are zero-filled."""
+    for chunk_start in range(start, stop, _PADDING_CHUNK):
+        chunk_stop = min(chunk_start + _PADDING_CHUNK, stop)
+        try:
+            rows = node[chunk_start:chunk_stop]
+        except Exception:
+            # Cannot inspect the tail -> keep the conservative array length.
+            return False
+        if not all(_is_empty_value(value) for value in rows):
+            return False
+    return True
+
+
+def _image_tail_is_padding(node: Any, start: int, stop: int) -> bool:
+    """Return True when the encoded frames ``[start, stop)`` are padding.
+
+    EgoVerse repeats the last real image into the preallocated tail, so a
+    repeat of frame ``start - 1`` counts as padding alongside empty bytes.
+    """
+    try:
+        anchor = _payload_key(_unwrap(node[start - 1]))
+    except Exception:
+        return False
+    for chunk_start in range(start, stop, _PADDING_CHUNK):
+        chunk_stop = min(chunk_start + _PADDING_CHUNK, stop)
+        try:
+            rows = node[chunk_start:chunk_stop]
+        except Exception:
+            return False
+        for value in rows:
+            value = _unwrap(value)
+            if _is_empty_value(value):
+                continue
+            if anchor is not None and _payload_key(value) == anchor:
+                continue
+            return False
+    return True
+
+
+def _payload_key(value: Any) -> bytes | None:
+    """Return a comparable identity for an encoded frame or image array."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    array = np.asarray(value)
+    if array.dtype.kind == "O":
+        return None
+    return array.tobytes()
+
+
+def _is_empty_value(value: Any) -> bool:
+    """Return True for a padding value: zero numbers, empty bytes, or NaN."""
+    value = _unwrap(value)
+    if value is None:
+        return True
+    if isinstance(value, (bytes, bytearray)):
+        return len(value) == 0
+    if isinstance(value, str):
+        return not value
+    array = np.asarray(value)
+    if array.size == 0:
+        return True
+    if array.dtype.kind in "fc":
+        return bool(np.all(array == 0) or np.all(np.isnan(array)))
+    return bool(np.all(array == 0))
 
 
 def _read_numeric_row(node: Any, index: int) -> np.ndarray:
