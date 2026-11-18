@@ -35,6 +35,7 @@ features:
     dtype: float32
     shape: [14]
     source:  [obs.ee_pose_left, obs.ee_pose_right]
+    combine: concat
     transforms:
       - op: astype
         dtype: float32
