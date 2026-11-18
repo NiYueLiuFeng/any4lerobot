@@ -59,6 +59,8 @@ features:
     dtype: float32
     shape: [7]
     source: proprio.qpos             # reader 输出的 key
+    # 每个维度的含义，写入 LeRobot 的 names 元信息
+    key_name: [x, y, z, qx, qy, qz, qw]
 
   action:
     dtype: float32
@@ -123,7 +125,8 @@ writer:
 | `default` | 可选 | 所有 `source` 都找不到时使用的常量 |
 | `required` | 可选 | 默认 `true`；设为 `false` 时缺失会得到 `None` 而不是报错 |
 | `transforms` | 可选 | 按顺序应用的变换列表 |
-| `names` | 可选 | 维度名元信息，原样写入 LeRobot feature |
+| `names` | 可选 | 维度名元信息，原样写入 LeRobot feature（不做校验） |
+| `key_name` | 可选 | 每个维度的含义，如 `[left_x, left_y, left_z]`；按 `shape` 校验并展开后写入 LeRobot 的 `names` |
 | `combine` | 可选 | `first`（默认，候选里第一个存在的胜出）或 `concat`（按声明顺序拼接所有 `sources`） |
 | `lookahead` | 可选 | 非负整数，默认 `0`；`1` 表示源值取自下一帧（`action[t] = state[t+1]`），到结尾钳制到最后一帧 |
 
@@ -132,6 +135,9 @@ writer:
 - `dtype` 必须在允许集合内；`shape` 必须是正整数列表；
 - 既没有 `source` 也没有 `default` 且 `required: true` 的 feature 会被拒绝；
 - `source` 和 `sources` 不要同时写；
+- `key_name` 必须与 `shape` 匹配：数值特征每个元素一个名字（`[21, 3]` 需要 63 个），
+  图像/视频特征每个轴一个名字（如 `[height, width, channels]`）；嵌套列表按行优先展开；
+- `key_name` 与 `names` 不要同时写（前者会校验并展平，后者原样透传）；
 - `combine: concat` 必须至少有一个 `source`，且不能同时使用 `default`；
 - `lookahead` 必须是非负整数（`true`/`"1"` 都不接受）；
 - feature 名不能为空。

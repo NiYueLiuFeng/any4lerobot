@@ -16,6 +16,7 @@ is intentionally small and explicit::
         dtype: float32
         shape: [7]
         source: proprio.qpos
+        key_name: [x, y, z, qx, qy, qz, qw]   # per-dimension meaning
 
       observation.images.head:
         dtype: image
@@ -34,6 +35,12 @@ A source may be a single dotted path or a list of candidates; the first one
 found wins.  A feature without ``source`` and without ``default`` is rejected
 at load time.  ``required: false`` turns a missing value into ``None`` instead
 of an error.
+
+``key_name`` names every dimension of the feature and is written to LeRobot's
+``names`` metadata.  Numeric features take one name per element (nested lists
+matching ``shape`` are flattened row-major); image/video features take one name
+per axis (e.g. ``[height, width, channels]``).  The length is validated against
+``shape`` at load time.
 
 Two composition options extend that rule:
 
@@ -110,7 +117,11 @@ class FeatureSpec:
     default: Any = _MISSING
     required: bool = True
     transforms: tuple[TransformSpec, ...] = ()
+    #: Raw LeRobot ``names`` metadata, passed through unchanged.
     names: Any = None
+    #: Per-dimension names (``key_name``), flattened row-major and validated
+    #: against ``shape``; written to LeRobot's ``names`` metadata.
+    key_name: tuple[str, ...] | None = None
     #: ``"first"`` (first source found wins) or ``"concat"`` (join all sources).
     combine: str = "first"
     #: Resolve sources from this many frames ahead; clamped at the episode end.
@@ -201,7 +212,9 @@ class FeatureSpec:
             "dtype": self.dtype,
             "shape": tuple(self.shape or (1,)),
         }
-        if self.names is not None:
+        if self.key_name is not None:
+            feature["names"] = list(self.key_name)
+        elif self.names is not None:
             feature["names"] = self.names
         return feature
 
@@ -327,6 +340,7 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
         "required",
         "transforms",
         "names",
+        "key_name",
         "combine",
         "lookahead",
     }
@@ -378,6 +392,13 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
     if not isinstance(lookahead, int) or isinstance(lookahead, bool) or lookahead < 0:
         raise MappingError(f"feature {name!r}: lookahead must be a non-negative integer")
 
+    if "key_name" in raw and "names" in raw:
+        raise MappingError(
+            f"feature {name!r}: use either key_name or names, not both "
+            "(key_name is validated and flattened)"
+        )
+    key_name = _parse_key_name(name, raw.get("key_name"), shape, dtype)
+
     transforms = tuple(_parse_transform(name, item) for item in raw.get("transforms", []) or [])
     for transform in transforms:
         if transform.op not in _TEMPORAL_OPS:
@@ -397,9 +418,62 @@ def _parse_feature(name: str, raw: Any) -> FeatureSpec:
         required=bool(raw.get("required", True)),
         transforms=transforms,
         names=raw.get("names"),
+        key_name=key_name,
         combine=combine,
         lookahead=lookahead,
     )
+
+
+def _parse_key_name(
+    feature: str,
+    raw: Any,
+    shape: tuple[int, ...] | None,
+    dtype: str,
+) -> tuple[str, ...] | None:
+    """Validate ``key_name`` and flatten it row-major.
+
+    Numeric features need one name per element (``prod(shape)``); image/video
+    features need one name per axis (``len(shape)``, e.g. height/width/channels).
+    Nested lists matching ``shape`` are accepted and flattened.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+        raise MappingError(f"feature {feature!r}: key_name must be a list of strings")
+    if shape is None:
+        raise MappingError(f"feature {feature!r}: key_name requires an explicit shape")
+
+    names: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str) and value:
+            names.append(value)
+        else:
+            raise MappingError(
+                f"feature {feature!r}: key_name entries must be non-empty strings"
+            )
+
+    walk(raw)
+    if not names:
+        raise MappingError(f"feature {feature!r}: key_name is empty")
+
+    expected = len(shape) if dtype in {"image", "video"} else _prod(shape)
+    if len(names) != expected:
+        raise MappingError(
+            f"feature {feature!r}: key_name has {len(names)} entries but "
+            f"shape {list(shape)} needs {expected}"
+        )
+    return tuple(names)
+
+
+def _prod(shape: Sequence[int]) -> int:
+    total = 1
+    for dim in shape:
+        total *= dim
+    return total
 
 
 def _task_spec(**kwargs: Any) -> FeatureSpec:

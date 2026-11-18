@@ -167,6 +167,106 @@ class MappingTest(unittest.TestCase):
         )
         self.assertEqual(config.lerobot_features()["x"]["shape"], (3,))
 
+    def test_key_name_becomes_lerobot_names(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "observation.state": {
+                        "dtype": "float32",
+                        "shape": [3],
+                        "source": "a",
+                        "key_name": ["x", "y", "z"],
+                    }
+                },
+            }
+        )
+        spec = config.features["observation.state"]
+        self.assertEqual(spec.key_name, ("x", "y", "z"))
+        self.assertEqual(
+            config.lerobot_features()["observation.state"]["names"],
+            ["x", "y", "z"],
+        )
+
+    def test_key_name_nested_is_flattened_row_major(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "keypoints": {
+                        "dtype": "float32",
+                        "shape": [2, 3],
+                        "source": "a",
+                        "key_name": [["x0", "y0", "z0"], ["x1", "y1", "z1"]],
+                    }
+                },
+            }
+        )
+        self.assertEqual(
+            config.lerobot_features()["keypoints"]["names"],
+            ["x0", "y0", "z0", "x1", "y1", "z1"],
+        )
+
+    def test_key_name_for_image_uses_axis_names(self) -> None:
+        config = MappingConfig.from_dict(
+            {
+                "fps": 10,
+                "features": {
+                    "observation.images.front": {
+                        "dtype": "image",
+                        "shape": [480, 640, 3],
+                        "source": "a",
+                        "key_name": ["height", "width", "channels"],
+                    }
+                },
+            }
+        )
+        self.assertEqual(
+            config.lerobot_features()["observation.images.front"]["names"],
+            ["height", "width", "channels"],
+        )
+
+    def test_key_name_must_match_shape(self) -> None:
+        base = {"dtype": "float32", "shape": [3], "source": "a"}
+        with self.assertRaises(MappingError):
+            MappingConfig.from_dict(
+                {"fps": 10, "features": {"x": {**base, "key_name": ["x", "y"]}}}
+            )
+        with self.assertRaises(MappingError):
+            MappingConfig.from_dict(
+                {"fps": 10, "features": {"x": {**base, "key_name": "xyz"}}}
+            )
+        with self.assertRaises(MappingError):
+            MappingConfig.from_dict(
+                {"fps": 10, "features": {"x": {**base, "key_name": ["x", "", "z"]}}}
+            )
+        with self.assertRaises(MappingError):
+            MappingConfig.from_dict(
+                {
+                    "fps": 10,
+                    "features": {
+                        "x": {"dtype": "float32", "source": "a", "key_name": ["x"]}
+                    },
+                }
+            )
+
+    def test_key_name_and_names_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(MappingError):
+            MappingConfig.from_dict(
+                {
+                    "fps": 10,
+                    "features": {
+                        "x": {
+                            "dtype": "float32",
+                            "shape": [2],
+                            "source": "a",
+                            "key_name": ["a", "b"],
+                            "names": ["a", "b"],
+                        }
+                    },
+                }
+            )
+
     def test_lookahead_uses_next_record_and_clamps_last(self) -> None:
         config = MappingConfig.from_dict(
             {

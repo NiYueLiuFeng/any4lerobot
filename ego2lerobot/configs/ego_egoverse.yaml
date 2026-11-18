@@ -36,6 +36,9 @@ features:
     shape: [14]
     source:  [obs.ee_pose_left, obs.ee_pose_right]
     combine: concat
+    key_name:
+      [left_x, left_y, left_z, left_qx, left_qy, left_qz, left_qw,
+       right_x, right_y, right_z, right_qx, right_qy, right_qz, right_qw]
     transforms:
       - op: astype
         dtype: float32
@@ -48,6 +51,9 @@ features:
     shape: [14]
     sources: [obs.ee_pose_left, obs.ee_pose_right]
     combine: concat
+    key_name:
+      [left_x, left_y, left_z, left_qx, left_qy, left_qz, left_qw,
+       right_x, right_y, right_z, right_qx, right_qy, right_qz, right_qw]
     transforms:
       - op: state_to_action
       - op: astype
@@ -57,6 +63,7 @@ features:
     dtype: image
     shape: [480, 640, 3]
     source: cameras.front
+    key_name: [height, width, channels]
     transforms:
       - op: as_image
         dtype: uint8
@@ -66,6 +73,7 @@ features:
     dtype: float32
     shape: [7]
     source: obs.ee_pose_left
+    key_name: [left_x, left_y, left_z, left_qx, left_qy, left_qz, left_qw]
     transforms:
       - op: astype
         dtype: float32
@@ -74,6 +82,7 @@ features:
     dtype: float32
     shape: [7]
     source: obs.ee_pose_right
+    key_name: [right_x, right_y, right_z, right_qx, right_qy, right_qz, right_qw]
     transforms:
       - op: astype
         dtype: float32
@@ -82,6 +91,7 @@ features:
     dtype: float32
     shape: [7]
     source: obs.head_pose
+    key_name: [head_x, head_y, head_z, head_qx, head_qy, head_qz, head_qw]
     transforms:
       - op: astype
         dtype: float32
@@ -90,6 +100,7 @@ features:
     dtype: float32
     shape: [3]
     source: obs.eye_gaze
+    key_name: [gaze_x, gaze_y, gaze_z]
     transforms:
       - op: astype
         dtype: float32
@@ -98,6 +109,8 @@ features:
     dtype: float32
     shape: [21, 3]
     source: obs.obs_keypoints_left
+    # key_name for shape [21, 3] takes 63 entries (row-major) or 21 nested
+    # [x, y, z] rows, e.g. [[j0_x, j0_y, j0_z], [j1_x, ...], ...].
     transforms:
       - op: reshape
         shape: [21, 3]
