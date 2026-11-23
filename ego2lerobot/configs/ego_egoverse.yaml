@@ -5,12 +5,17 @@
 #
 #   2025-09-20-17-42-51-000000/
 #     zarr.json                 # embodiment / fps / task_name / features
-#     right.obs_ee_pose/        # (T, 7) float64
+#     right.obs_ee_pose/        # (T, 7) float64, xyz + quaternion
 #     left.obs_ee_pose/         # (T, 7) float64
+#     right.obs_wrist_pose/     # (T, 7) float64
+#     left.obs_wrist_pose/      # (T, 7) float64
+#     right.obs_keypoints/      # (T, 63) float64, 21 points x xyz
+#     left.obs_keypoints/       # (T, 63) float64
 #     obs_head_pose/            # (T, 7) float64
 #     obs_eye_gaze/             # (T, 3) float64
-#     obs_rgb_timestamps_ns/    # (T,) int64
+#     obs_rgb_timestamps_ns/    # (T,) int64, device clock
 #     images.front_1/           # (T,) variable-length JPEG bytes
+#     annotations/              # (N,) JSON strings (may be empty)
 #
 # Run:
 #   python -m ego2lerobot convert -c ego2lerobot/configs/ego_egoverse.yaml \
@@ -29,12 +34,11 @@ task:
   default: ego manipulation
 
 features:
-  # Single-arm state for the example.  For bimanual data, concatenate left +
-  # right (see the note in reader.arrays below) or add a composed source.
+  # Bimanual state: concatenate the left + right end-effector poses.
   observation.state:
     dtype: float32
     shape: [14]
-    source:  [obs.ee_pose_left, obs.ee_pose_right]
+    source: [obs.ee_pose_left, obs.ee_pose_right]
     combine: concat
     key_name:
       [left_x, left_y, left_z, left_qx, left_qy, left_qz, left_qw,
@@ -87,6 +91,26 @@ features:
       - op: astype
         dtype: float32
 
+  # Wrist poses are separate streams in this episode.  They are also the
+  # keypoint reference: keypoints[5] == obs_wrist_pose xyz (see hand_*_world).
+  observation.state.wrist_pose_left:
+    dtype: float32
+    shape: [7]
+    source: obs.wrist_pose_left
+    key_name: [left_x, left_y, left_z, left_qx, left_qy, left_qz, left_qw]
+    transforms:
+      - op: astype
+        dtype: float32
+
+  observation.state.wrist_pose_right:
+    dtype: float32
+    shape: [7]
+    source: obs.wrist_pose_right
+    key_name: [right_x, right_y, right_z, right_qx, right_qy, right_qz, right_qw]
+    transforms:
+      - op: astype
+        dtype: float32
+
   observation.state.head_pose:
     dtype: float32
     shape: [7]
@@ -109,8 +133,35 @@ features:
     dtype: float32
     shape: [21, 3]
     source: obs.obs_keypoints_left
-    # key_name for shape [21, 3] takes 63 entries (row-major) or 21 nested
-    # [x, y, z] rows, e.g. [[j0_x, j0_y, j0_z], [j1_x, ...], ...].
+    # Raw Aria 21-point layout, which is what this episode stores (NOT the
+    # canonical MANO order): 0-4 fingertips, 5 wrist/palm root, 6-7 thumb,
+    # 8-10 index, 11-13 middle, 14-16 ring, 17-19 little, 20 palm centre.
+    # Verified on this episode: keypoints[5] equals obs_wrist_pose xyz and
+    # keypoints[20] equals obs_ee_pose xyz; joint edges are rigid over time.
+    # A dataset that stores canonical MANO keypoints needs a different name
+    # list (wrist, thumb, index, middle, ring, little).
+    key_name:
+      - [left_thumb_tip_x, left_thumb_tip_y, left_thumb_tip_z]
+      - [left_index_tip_x, left_index_tip_y, left_index_tip_z]
+      - [left_middle_tip_x, left_middle_tip_y, left_middle_tip_z]
+      - [left_ring_tip_x, left_ring_tip_y, left_ring_tip_z]
+      - [left_little_tip_x, left_little_tip_y, left_little_tip_z]
+      - [left_wrist_x, left_wrist_y, left_wrist_z]
+      - [left_thumb_mcp_x, left_thumb_mcp_y, left_thumb_mcp_z]
+      - [left_thumb_ip_x, left_thumb_ip_y, left_thumb_ip_z]
+      - [left_index_mcp_x, left_index_mcp_y, left_index_mcp_z]
+      - [left_index_pip_x, left_index_pip_y, left_index_pip_z]
+      - [left_index_dip_x, left_index_dip_y, left_index_dip_z]
+      - [left_middle_mcp_x, left_middle_mcp_y, left_middle_mcp_z]
+      - [left_middle_pip_x, left_middle_pip_y, left_middle_pip_z]
+      - [left_middle_dip_x, left_middle_dip_y, left_middle_dip_z]
+      - [left_ring_mcp_x, left_ring_mcp_y, left_ring_mcp_z]
+      - [left_ring_pip_x, left_ring_pip_y, left_ring_pip_z]
+      - [left_ring_dip_x, left_ring_dip_y, left_ring_dip_z]
+      - [left_little_mcp_x, left_little_mcp_y, left_little_mcp_z]
+      - [left_little_pip_x, left_little_pip_y, left_little_pip_z]
+      - [left_little_dip_x, left_little_dip_y, left_little_dip_z]
+      - [left_palm_center_x, left_palm_center_y, left_palm_center_z]
     transforms:
       - op: reshape
         shape: [21, 3]
@@ -121,6 +172,29 @@ features:
     dtype: float32
     shape: [21, 3]
     source: obs.obs_keypoints_right
+    # Same raw Aria order as hand_left_world.
+    key_name:
+      - [right_thumb_tip_x, right_thumb_tip_y, right_thumb_tip_z]
+      - [right_index_tip_x, right_index_tip_y, right_index_tip_z]
+      - [right_middle_tip_x, right_middle_tip_y, right_middle_tip_z]
+      - [right_ring_tip_x, right_ring_tip_y, right_ring_tip_z]
+      - [right_little_tip_x, right_little_tip_y, right_little_tip_z]
+      - [right_wrist_x, right_wrist_y, right_wrist_z]
+      - [right_thumb_mcp_x, right_thumb_mcp_y, right_thumb_mcp_z]
+      - [right_thumb_ip_x, right_thumb_ip_y, right_thumb_ip_z]
+      - [right_index_mcp_x, right_index_mcp_y, right_index_mcp_z]
+      - [right_index_pip_x, right_index_pip_y, right_index_pip_z]
+      - [right_index_dip_x, right_index_dip_y, right_index_dip_z]
+      - [right_middle_mcp_x, right_middle_mcp_y, right_middle_mcp_z]
+      - [right_middle_pip_x, right_middle_pip_y, right_middle_pip_z]
+      - [right_middle_dip_x, right_middle_dip_y, right_middle_dip_z]
+      - [right_ring_mcp_x, right_ring_mcp_y, right_ring_mcp_z]
+      - [right_ring_pip_x, right_ring_pip_y, right_ring_pip_z]
+      - [right_ring_dip_x, right_ring_dip_y, right_ring_dip_z]
+      - [right_little_mcp_x, right_little_mcp_y, right_little_mcp_z]
+      - [right_little_pip_x, right_little_pip_y, right_little_pip_z]
+      - [right_little_dip_x, right_little_dip_y, right_little_dip_z]
+      - [right_palm_center_x, right_palm_center_y, right_palm_center_z]
     transforms:
       - op: reshape
         shape: [21, 3]
@@ -136,9 +210,11 @@ reader:
   arrays:
     obs.ee_pose_left: left.obs_ee_pose
     obs.ee_pose_right: right.obs_ee_pose
+    obs.wrist_pose_left: left.obs_wrist_pose
+    obs.wrist_pose_right: right.obs_wrist_pose
     obs.head_pose: obs_head_pose
     obs.eye_gaze: obs_eye_gaze
-    obs.timestamps_ns: obs_rgb_timestamps_ns
+    obs.timestamps_ns: obs_rgb_timestamps_ns      # device clock (not a feature)
     obs.obs_keypoints_left: left.obs_keypoints
     obs.obs_keypoints_right: right.obs_keypoints
 
