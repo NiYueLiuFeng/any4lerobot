@@ -234,9 +234,10 @@ python -m ego2lerobot.demo.egoverse_demo --to-lerobot \
 /tmp/ego_egoverse_demo/output/
   2025-09-20-17-42-51-000000-<hash>/
     _SUCCESS                  # 原子提交标记；重跑时任务直接 skipped
-    meta/info.json            # fps / features / total_frames
+    meta/info.json            # fps / features / total_frames（codebase_version v3.0）
     data/... parquet
-    images/...                # writer.use_videos=false 时的 PNG 帧
+    videos/<feature>/...      # dtype: video + use_videos=true 时的 MP4
+    images/<feature>/...      # dtype: image（或 use_videos=false）时的 PNG 帧
 ```
 
 脚本转换完成后会用 `LeRobotDataset(repo_id, root=...)` 读回产物并打印
@@ -407,7 +408,7 @@ def _process_one(task, config):
 - `--ray-address local` 只适合单机调试；多机必须 `ray start` 后用 `auto` 或具体地址。
 - `ray_demo.py` 的“聚合”只是写 `summary.json`；`convert/worker.py` + `convert/run.py` 走真实 `aggregate_datasets`，并按 task 原始顺序构造输入列表。
 - 每个 task 的数据集根目录里会多写一个 `_conversion.json`（来源文件、reader、config 路径），用于审计；LeRobot 读取时会忽略它。
-- `writer.use_videos: true` 需要可用的 ffmpeg 与编码器；当前示例默认 `false`（PNG 帧），确认集群编码器后再打开。
+- LeRobot v3 的 `dtype: video` 特征必须配 `writer.use_videos: true`，否则配置加载时会直接报错；`ego_egoverse.yaml` 即用这种方式把相机存成 MP4。编码需要可用的 ffmpeg 与编码器（默认 `libsvtav1`，可用 `writer.vcodec: h264` 换编码）。`ego_h5.yaml` / `ego_mcap.yaml` 仍用 `dtype: image` + `use_videos: false` 存 PNG。
 - 单机 Ray 启动有 2~5 秒固定开销；小数据量下并行收益会被启动时间掩盖。
 - 单 task 解码失败会写 `<output>.failed.json`；修复源文件后重跑会跳过已成功的 task。
 

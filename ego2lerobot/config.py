@@ -144,6 +144,19 @@ class PipelineConfig:
         if unknown_aggregate:
             raise PipelineConfigError(f"unknown aggregate keys: {sorted(unknown_aggregate)}")
 
+        # LeRobot writes dtype "video" features as MP4 only in video mode.
+        # Without this check the mismatch surfaces much later, inside
+        # LeRobotDataset.create() after the reader is already running.
+        video_features = sorted(
+            name for name, spec in mapping.features.items() if spec.dtype == "video"
+        )
+        if video_features and not writer.get("use_videos", True):
+            raise PipelineConfigError(
+                "writer.use_videos is false but features use dtype 'video': "
+                f"{video_features}; set writer.use_videos: true to store them as "
+                "MP4 (LeRobot v3), or change them to dtype 'image' for PNG frames"
+            )
+
         return cls(
             mapping=mapping,
             reader=reader,

@@ -64,7 +64,7 @@ features:
         dtype: float32
 
   observation.images.front:
-    dtype: image
+    dtype: video
     shape: [480, 640, 3]
     source: cameras.front
     key_name: [height, width, channels]
@@ -230,5 +230,6 @@ reader:
   decode_images: true        # false -> hand back raw encoded bytes
 
 writer:
-  use_videos: false
-  image_writer_threads: 2
+  # LeRobot v3 stores `dtype: video` features as MP4, so this must be true.
+  # Default codec is libsvtav1; set `vcodec: h264` for broader player support.
+  use_videos: true
