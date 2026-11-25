@@ -408,7 +408,7 @@ def _process_one(task, config):
 - `--ray-address local` 只适合单机调试；多机必须 `ray start` 后用 `auto` 或具体地址。
 - `ray_demo.py` 的“聚合”只是写 `summary.json`；`convert/worker.py` + `convert/run.py` 走真实 `aggregate_datasets`，并按 task 原始顺序构造输入列表。
 - 每个 task 的数据集根目录里会多写一个 `_conversion.json`（来源文件、reader、config 路径），用于审计；LeRobot 读取时会忽略它。
-- LeRobot v3 的 `dtype: video` 特征必须配 `writer.use_videos: true`，否则配置加载时会直接报错；`ego_egoverse.yaml` 即用这种方式把相机存成 MP4。编码需要可用的 ffmpeg 与编码器（默认 `libsvtav1`，可用 `writer.vcodec: h264` 换编码）。`ego_h5.yaml` / `ego_mcap.yaml` 仍用 `dtype: image` + `use_videos: false` 存 PNG。
+- LeRobot v3 的 `dtype: video` 特征必须配 `writer.use_videos: true`，否则配置加载时会直接报错；`ego_egoverse.yaml` 即用这种方式把相机存成 MP4。编码需要可用的 ffmpeg 与编码器；`ego_egoverse.yaml` 用 `writer.vcodec: h264` 以获得更好的播放器兼容性（LeRobot 默认是 `libsvtav1`，文件更小但部分播放器支持不佳）。`ego_h5.yaml` / `ego_mcap.yaml` 仍用 `dtype: image` + `use_videos: false` 存 PNG。
 - 单机 Ray 启动有 2~5 秒固定开销；小数据量下并行收益会被启动时间掩盖。
 - 单 task 解码失败会写 `<output>.failed.json`；修复源文件后重跑会跳过已成功的 task。
 

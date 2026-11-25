@@ -805,6 +805,27 @@ class PipelineConfigTest(unittest.TestCase):
                 }
             )
 
+    def test_video_feature_requires_use_videos(self) -> None:
+        payload = {
+            "repo_id": "ego/test",
+            "fps": 10,
+            "features": {
+                "observation.images.front": {
+                    "dtype": "video",
+                    "shape": [4, 4, 3],
+                    "source": "cam",
+                },
+            },
+            "reader": {"type": "h5", "arrays": {"cam": "/cam"}},
+            "writer": {"use_videos": False},
+        }
+        with self.assertRaises(PipelineConfigError):
+            PipelineConfig.from_dict(payload)
+
+        payload["writer"] = {"use_videos": True}
+        pipeline = PipelineConfig.from_dict(payload)
+        self.assertEqual(pipeline.mapping.features["observation.images.front"].dtype, "video")
+
 
 if __name__ == "__main__":
     unittest.main()

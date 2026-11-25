@@ -231,5 +231,7 @@ reader:
 
 writer:
   # LeRobot v3 stores `dtype: video` features as MP4, so this must be true.
-  # Default codec is libsvtav1; set `vcodec: h264` for broader player support.
+  # h264 matches the reference EgoDemo datasets and plays in more players than
+  # LeRobot's default libsvtav1; switch back to libsvtav1 for smaller files.
   use_videos: true
+  vcodec: h264
